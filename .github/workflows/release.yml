@@ -1,0 +1,78 @@
+# GitHub Actions workflow that builds the portable Windows executable and
+# publishes a GitHub Release whenever a version tag (v*) is pushed.
+#
+# It can also be triggered manually from the Actions tab (workflow_dispatch),
+# in which case it builds and uploads to a release named after the chosen tag.
+#
+# The release artifact is a single, statically-linked (static CRT) .exe that
+# needs no installer and no Visual C++ redistributable.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0). Must already exist or will be created from the current ref."
+        required: true
+        default: "v0.1.0"
+
+# The default GITHUB_TOKEN needs write access to create the release and
+# upload assets.
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x64 and publish release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the exact compiler version, so rustup will
+      # auto-install it on the first cargo invocation. We add the MSVC target
+      # explicitly to be safe.
+      - name: Show Rust version
+        run: rustup show
+
+      # Build the release binary with a static CRT so the .exe is fully
+      # portable (no VC++ runtime dependency). The default target on
+      # windows-latest is x86_64-pc-windows-msvc.
+      - name: Build release (static CRT)
+        shell: bash
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --release
+
+      - name: Determine tag name
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Publish the release and attach the .exe. softprops/action-gh-release
+      # creates the release if it does not exist and uploads the binary.
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: Fast-copy ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          files: target/release/fast-copy.exe
+          body: |
+            Portable Windows x64 build of Fast-copy.
+
+            Download `fast-copy.exe` below and run it directly: no installer,
+            no Visual C++ redistributable required (the C runtime is statically
+            linked).
+
+            See the README for usage, the benchmark explanation, and known
+            limitations (notably: ACLs are not preserved).
