@@ -32,6 +32,9 @@ const PROGRESS_CONTINUE: u32 = 0;
 const PROGRESS_CANCEL: u32 = 1;
 const PROGRESS_STOP: u32 = 2;
 
+/// Sentinel error returned when PROGRESS_STOP was used for pause.
+pub const PAUSE_SENTINEL: &str = "__FAST_COPY_PAUSED__";
+
 /// Data passed to the progress callback via the lpData parameter.
 struct ProgressContext {
     index: usize,
@@ -41,12 +44,13 @@ struct ProgressContext {
 }
 
 /// The progress routine called by CopyFileExW during the copy.
-/// It reports progress and checks for pause/cancel requests.
+/// Reports progress using total_bytes_transferred (monotonic across all
+/// NTFS streams) and checks for pause/cancel requests.
 unsafe extern "system" fn progress_routine(
     _total_file_size: LARGE_INTEGER,
-    _total_bytes_transferred: LARGE_INTEGER,
+    total_bytes_transferred: LARGE_INTEGER,
     _stream_size: LARGE_INTEGER,
-    stream_bytes_transferred: LARGE_INTEGER,
+    _stream_bytes_transferred: LARGE_INTEGER,
     _stream_number: u32,
     _callback_reason: LPPROGRESS_ROUTINE_CALLBACK_REASON,
     _source_file: HANDLE,
@@ -59,25 +63,23 @@ unsafe extern "system" fn progress_routine(
 
     let ctx = &*(lp_data as *const ProgressContext);
 
-    // Report progress.
-    let transferred = stream_bytes_transferred as u64;
+    // Use total_bytes_transferred (not stream_bytes_transferred) so progress
+    // is monotonically increasing across all NTFS alternate data streams.
+    let transferred = total_bytes_transferred as u64;
     let _ = ctx.tx.send(WorkerMessage::Progress {
         index: ctx.index,
         bytes_copied: transferred,
         total_bytes: ctx.total_bytes,
     });
 
-    // Update global counter.
-    ctx.control
-        .total_bytes_copied
-        .fetch_add(0, std::sync::atomic::Ordering::Relaxed);
-
-    // Check cancel.
     if ctx.control.is_cancelled() {
         return PROGRESS_CANCEL;
     }
 
-    // Check pause: PROGRESS_STOP tells CopyFileExW to pause (restartable).
+    // PROGRESS_STOP causes CopyFileExW to return ERROR_REQUEST_ABORTED.
+    // The caller (copy_file_win32) distinguishes this from a real cancel
+    // by checking the pause flag and returning a sentinel error so the
+    // worker can retry after pause is lifted.
     if ctx.control.is_paused() {
         return PROGRESS_STOP;
     }
@@ -137,9 +139,16 @@ pub fn copy_file_win32(
         Ok(()) => Ok(()),
         Err(e) => {
             let code = e.code();
-            // ERROR_REQUEST_ABORTED (1235) is expected on cancel.
-            if code.0 as u32 == 1235 {
-                Err("Copy cancelled by user".to_string())
+            // ERROR_REQUEST_ABORTED (0x800704D3 / Win32 1235) is returned both
+            // on PROGRESS_CANCEL and PROGRESS_STOP.
+            if code.0 as u32 == 0x800704D3 || code.0 as i32 == 1235 {
+                if control.is_paused() && !control.is_cancelled() {
+                    // The callback returned PROGRESS_STOP for pause.
+                    // Signal the worker to retry this file after resume.
+                    Err(PAUSE_SENTINEL.to_string())
+                } else {
+                    Err("Copy cancelled by user".to_string())
+                }
             } else {
                 Err(format!("CopyFileExW failed: {} (HRESULT: 0x{:08X})", e.message(), code.0))
             }
