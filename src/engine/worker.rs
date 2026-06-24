@@ -175,8 +175,31 @@ impl CopyOrchestrator {
                         }
                     }
 
-                    // Perform the actual copy.
-                    let result = perform_copy(&item, &config, &control, &tx, index);
+                    // Perform the actual copy. If the copy was interrupted by
+                    // a pause (PROGRESS_STOP), wait for resume and retry.
+                    // COPY_FILE_RESTARTABLE means the OS can pick up where it
+                    // left off on the next CopyFileExW call.
+                    let result = loop {
+                        let r = perform_copy(&item, &config, &control, &tx, index);
+                        match &r {
+                            Err(e) if is_pause_sentinel(e) => {
+                                // Wait for pause to be lifted, then retry.
+                                let _ = tx.send(WorkerMessage::Progress {
+                                    index,
+                                    bytes_copied: 0, // placeholder; real progress comes from callback
+                                    total_bytes: item.size,
+                                });
+                                while control.is_paused() && !control.is_cancelled() {
+                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                }
+                                if control.is_cancelled() {
+                                    break Err("Copy cancelled by user".to_string());
+                                }
+                                continue;
+                            }
+                            _ => break r,
+                        }
+                    };
 
                     match result {
                         Ok(()) => {
@@ -227,5 +250,18 @@ fn perform_copy(
     #[cfg(not(windows))]
     {
         crate::engine::stub::copy_file_stub(item, control, tx, index)
+    }
+}
+
+/// Check whether an error string is the pause sentinel from win32::copy_file_win32.
+fn is_pause_sentinel(err: &str) -> bool {
+    #[cfg(windows)]
+    {
+        err == crate::engine::win32::PAUSE_SENTINEL
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = err;
+        false
     }
 }
