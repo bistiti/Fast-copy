@@ -1,0 +1,231 @@
+// Copy worker: manages the thread pool and dispatches copy tasks.
+// On Windows, actual copying is performed via the win32 module.
+// On non-Windows (for compilation only), the stub module provides no-op implementations.
+
+use crate::config::Config;
+use crate::engine::copy_item::CopyItem;
+use crate::engine::journal::CopyJournal;
+use crossbeam_channel::Sender;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// Messages sent from the worker threads back to the UI.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum WorkerMessage {
+    /// Progress update for a specific file (by its index in the queue).
+    Progress {
+        index: usize,
+        bytes_copied: u64,
+        total_bytes: u64,
+    },
+    /// A file finished copying.
+    FileCompleted {
+        index: usize,
+    },
+    /// A file failed.
+    FileFailed {
+        index: usize,
+        error: String,
+    },
+    /// A file was skipped (already in journal).
+    FileSkipped {
+        index: usize,
+    },
+    /// All work is done.
+    AllDone,
+}
+
+/// Shared state for controlling copy operations (pause / cancel).
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct CopyControl {
+    pub cancel_requested: AtomicBool,
+    pub pause_requested: AtomicBool,
+    pub total_bytes_copied: AtomicU64,
+}
+
+#[allow(dead_code)]
+impl CopyControl {
+    pub fn new() -> Self {
+        Self {
+            cancel_requested: AtomicBool::new(false),
+            pause_requested: AtomicBool::new(false),
+            total_bytes_copied: AtomicU64::new(0),
+        }
+    }
+
+    pub fn request_cancel(&self) {
+        self.cancel_requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn request_pause(&self) {
+        self.pause_requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.pause_requested.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_requested.load(Ordering::SeqCst)
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.pause_requested.load(Ordering::SeqCst)
+    }
+
+    pub fn reset(&self) {
+        self.cancel_requested.store(false, Ordering::SeqCst);
+        self.pause_requested.store(false, Ordering::SeqCst);
+        self.total_bytes_copied.store(0, Ordering::SeqCst);
+    }
+}
+
+/// The copy orchestrator: builds the work queue and dispatches to threads.
+pub struct CopyOrchestrator {
+    pub config: Config,
+    pub control: Arc<CopyControl>,
+    pub journal: Arc<Mutex<CopyJournal>>,
+    pub message_tx: Sender<WorkerMessage>,
+}
+
+impl CopyOrchestrator {
+    pub fn new(
+        config: Config,
+        journal_path: PathBuf,
+        message_tx: Sender<WorkerMessage>,
+    ) -> Result<Self, String> {
+        let journal = CopyJournal::open(journal_path)?;
+        Ok(Self {
+            config,
+            control: Arc::new(CopyControl::new()),
+            journal: Arc::new(Mutex::new(journal)),
+            message_tx,
+        })
+    }
+
+    /// Start copying the given items on a thread pool.
+    /// This function spawns threads and returns immediately.
+    /// Progress and completion are reported via the message channel.
+    pub fn start(&self, items: Vec<CopyItem>) {
+        let thread_count = self.config.thread_count.max(1);
+        let control = Arc::clone(&self.control);
+        let journal = Arc::clone(&self.journal);
+        let tx = self.message_tx.clone();
+        let config = self.config.clone();
+
+        // Build a work queue: (index, item) pairs.
+        let work: Vec<(usize, CopyItem)> = items.into_iter().enumerate().collect();
+        let work = Arc::new(Mutex::new(work.into_iter().peekable()));
+
+        // Spawn worker threads.
+        let mut handles = Vec::with_capacity(thread_count);
+
+        for _tid in 0..thread_count {
+            let work = Arc::clone(&work);
+            let control = Arc::clone(&control);
+            let journal = Arc::clone(&journal);
+            let tx = tx.clone();
+            let config = config.clone();
+
+            let handle = std::thread::spawn(move || {
+                loop {
+                    if control.is_cancelled() {
+                        break;
+                    }
+
+                    // Spin-wait while paused (with a short sleep to avoid busy-waiting).
+                    while control.is_paused() && !control.is_cancelled() {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+
+                    // Grab next work item.
+                    let task = {
+                        let mut queue = work.lock().unwrap();
+                        queue.next()
+                    };
+
+                    let (index, item) = match task {
+                        Some(t) => t,
+                        None => break,
+                    };
+
+                    // Check journal for already-completed files.
+                    {
+                        let j = journal.lock().unwrap();
+                        if j.is_completed(&item.destination) {
+                            let _ = tx.send(WorkerMessage::FileSkipped { index });
+                            continue;
+                        }
+                    }
+
+                    // Ensure destination directory exists.
+                    if let Some(parent) = item.destination.parent() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            let _ = tx.send(WorkerMessage::FileFailed {
+                                index,
+                                error: format!(
+                                    "Failed to create directory {:?}: {}",
+                                    parent, e
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+
+                    // Perform the actual copy.
+                    let result = perform_copy(&item, &config, &control, &tx, index);
+
+                    match result {
+                        Ok(()) => {
+                            // Record in journal.
+                            if let Ok(mut j) = journal.lock() {
+                                let _ = j.record_completed(&item.destination);
+                            }
+                            let _ = tx.send(WorkerMessage::FileCompleted { index });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(WorkerMessage::FileFailed {
+                                index,
+                                error: e,
+                            });
+                        }
+                    }
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        // Spawn a monitor thread that waits for all workers, then sends AllDone.
+        let tx_done = tx.clone();
+        std::thread::spawn(move || {
+            for h in handles {
+                let _ = h.join();
+            }
+            let _ = tx_done.send(WorkerMessage::AllDone);
+        });
+    }
+}
+
+/// Perform the actual copy of a single file.
+/// On Windows, delegates to the win32 module.
+/// On non-Windows (cross-compilation), uses the stub.
+fn perform_copy(
+    item: &CopyItem,
+    _config: &Config,
+    control: &Arc<CopyControl>,
+    tx: &Sender<WorkerMessage>,
+    index: usize,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        crate::engine::win32::copy_file_win32(item, _config, control, tx, index)
+    }
+    #[cfg(not(windows))]
+    {
+        crate::engine::stub::copy_file_stub(item, control, tx, index)
+    }
+}
