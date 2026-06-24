@@ -4,6 +4,7 @@
 // On non-Windows platforms, this module provides a stub that returns default values,
 // since the actual benchmark relies on Win32 APIs (CopyFileExW with NO_BUFFERING).
 
+#[cfg(not(windows))]
 use crate::config::Config;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -242,9 +243,10 @@ fn write_test_file(path: &Path, size: u64) -> Result<(), String> {
 #[cfg(windows)]
 fn copy_with_mode(src: &Path, dst: &Path, unbuffered: bool) -> Result<(), String> {
     use windows::core::PCWSTR;
-    use windows::Win32::Storage::FileSystem::{
-        CopyFileExW, COPY_FILE_NO_BUFFERING,
-    };
+    use windows::Win32::Storage::FileSystem::CopyFileExW;
+
+    // CopyFileExW NO_BUFFERING flag from WinBase.h (see engine/win32.rs).
+    const COPY_FILE_NO_BUFFERING: u32 = 0x0000_1000;
 
     let src_wide: Vec<u16> = src
         .to_string_lossy()
@@ -258,7 +260,7 @@ fn copy_with_mode(src: &Path, dst: &Path, unbuffered: bool) -> Result<(), String
         .collect();
 
     let flags = if unbuffered {
-        COPY_FILE_NO_BUFFERING.0 as u32
+        COPY_FILE_NO_BUFFERING
     } else {
         0u32
     };
