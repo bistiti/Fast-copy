@@ -21,16 +21,19 @@ use crossbeam_channel::Sender;
 use std::sync::Arc;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, HANDLE, LARGE_INTEGER};
-use windows::Win32::Storage::FileSystem::{
-    CopyFileExW, COPY_FILE_NO_BUFFERING, COPY_FILE_RESTARTABLE,
-    LPPROGRESS_ROUTINE_CALLBACK_REASON,
-};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Storage::FileSystem::{CopyFileExW, LPPROGRESS_ROUTINE_CALLBACK_REASON};
 
 /// Progress callback return values (matching Win32 constants).
 const PROGRESS_CONTINUE: u32 = 0;
 const PROGRESS_CANCEL: u32 = 1;
 const PROGRESS_STOP: u32 = 2;
+
+// CopyFileExW flag values from WinBase.h. The `windows` crate exposes these
+// only under Win32::System::WindowsProgramming (an extra feature); they are
+// defined locally here because the ABI values are stable.
+const COPY_FILE_RESTARTABLE: u32 = 0x0000_0002;
+const COPY_FILE_NO_BUFFERING: u32 = 0x0000_1000;
 
 /// Sentinel error returned when PROGRESS_STOP was used for pause.
 pub const PAUSE_SENTINEL: &str = "__FAST_COPY_PAUSED__";
@@ -47,10 +50,10 @@ struct ProgressContext {
 /// Reports progress using total_bytes_transferred (monotonic across all
 /// NTFS streams) and checks for pause/cancel requests.
 unsafe extern "system" fn progress_routine(
-    _total_file_size: LARGE_INTEGER,
-    total_bytes_transferred: LARGE_INTEGER,
-    _stream_size: LARGE_INTEGER,
-    _stream_bytes_transferred: LARGE_INTEGER,
+    _total_file_size: i64,
+    total_bytes_transferred: i64,
+    _stream_size: i64,
+    _stream_bytes_transferred: i64,
     _stream_number: u32,
     _callback_reason: LPPROGRESS_ROUTINE_CALLBACK_REASON,
     _source_file: HANDLE,
@@ -112,9 +115,7 @@ pub fn copy_file_win32(
     // Choose copy flags based on the selected mode.
     let flags = match item.mode {
         CopyMode::Buffered => 0u32,
-        CopyMode::Unbuffered => {
-            (COPY_FILE_NO_BUFFERING.0 | COPY_FILE_RESTARTABLE.0) as u32
-        }
+        CopyMode::Unbuffered => COPY_FILE_NO_BUFFERING | COPY_FILE_RESTARTABLE,
     };
 
     let ctx = ProgressContext {
