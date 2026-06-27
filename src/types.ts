@@ -52,7 +52,12 @@ export interface Config {
 
 export type Phase = "idle" | "copying" | "paused" | "done";
 
-export type BenchmarkState = "notRun" | "running" | "completed" | "failed";
+export type BenchmarkState =
+  | "notRun"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
 
 export interface BenchmarkInfo {
   state: BenchmarkState;

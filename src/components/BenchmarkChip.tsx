@@ -1,9 +1,13 @@
 import { runBenchmark } from "../api";
 import { useStore } from "../store";
+import { Spinner } from "./Spinner";
 
 export function BenchmarkChip() {
   const benchmark = useStore((s) => s.benchmark);
   const phase = useStore((s) => s.phase);
+  const scanning = useStore((s) => s.scanning);
+
+  const running = benchmark.state === "running";
 
   const label = (() => {
     switch (benchmark.state) {
@@ -12,18 +16,20 @@ export function BenchmarkChip() {
       case "completed":
         return `Tuned · ${benchmark.thresholdMib} MiB · ${benchmark.threads} threads`;
       case "failed":
-        return `Benchmark failed`;
+        return "Benchmark failed";
+      case "cancelled":
+        return "Benchmark cancelled";
       default:
         return "Not benchmarked";
     }
   })();
 
-  const canRun = phase === "idle" && benchmark.state !== "running";
+  const canRun = phase === "idle" && !running && !scanning;
 
   return (
     <div className="bench">
       <span className={`chip chip-${benchmark.state}`}>
-        <span className="dot" />
+        {running ? <Spinner size={11} /> : <span className="dot" />}
         {label}
       </span>
       <button

@@ -6,9 +6,10 @@ use crate::dto::{DestinationInfo, QueueEntryDto, TreeDto};
 use crate::engine::copy_item::{long_path, CopyItem};
 use crate::engine::worker::{ConflictPolicy, CopyOrchestrator};
 use crate::engine::CopyJournal;
-use crate::sources::compute_destination;
+use crate::sources::{compute_destination, scan_directory, scan_paths};
 use crate::state::AppState;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -23,27 +24,47 @@ pub fn add_sources(paths: Vec<String>, state: State<AppState>) -> TreeDto {
     TreeDto::from_list(&sources)
 }
 
+/// Add a directory. Async so Tauri runs it off the main thread; the recursive
+/// filesystem scan happens on a blocking worker so the UI stays responsive, and
+/// it can be aborted via the shared scan-cancel flag (Stop button).
 #[tauri::command]
-pub fn add_directory(path: String, state: State<AppState>) -> TreeDto {
+pub async fn add_directory(path: String, state: State<'_, AppState>) -> Result<TreeDto, String> {
+    let cancel = state.scan_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+
+    let p = PathBuf::from(path);
+    let node = tauri::async_runtime::spawn_blocking(move || scan_directory(p, &cancel))
+        .await
+        .map_err(|e| e.to_string())?;
+
     let mut sources = state.sources.lock().unwrap();
-    sources.add_directory(PathBuf::from(path));
-    TreeDto::from_list(&sources)
+    // `None` means the scan was cancelled: leave the tree unchanged.
+    if let Some(node) = node {
+        sources.roots.push(node);
+    }
+    Ok(TreeDto::from_list(&sources))
 }
 
 /// Add a mix of files and folders (used by drag-and-drop, where the frontend
-/// doesn't know which paths are directories). Each path is classified here.
+/// doesn't know which paths are directories). Scanning runs off-thread and is
+/// cancellable, same as `add_directory`.
 #[tauri::command]
-pub fn add_paths(paths: Vec<String>, state: State<AppState>) -> TreeDto {
+pub async fn add_paths(paths: Vec<String>, state: State<'_, AppState>) -> Result<TreeDto, String> {
+    let cancel = state.scan_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+
+    let pbs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+    let nodes = tauri::async_runtime::spawn_blocking(move || scan_paths(pbs, &cancel))
+        .await
+        .map_err(|e| e.to_string())?;
+
     let mut sources = state.sources.lock().unwrap();
-    for p in paths {
-        let pb = PathBuf::from(p);
-        if pb.is_dir() {
-            sources.add_directory(pb);
-        } else {
-            sources.add_file(pb);
+    if let Some(nodes) = nodes {
+        for n in nodes {
+            sources.roots.push(n);
         }
     }
-    TreeDto::from_list(&sources)
+    Ok(TreeDto::from_list(&sources))
 }
 
 #[tauri::command]
@@ -110,10 +131,13 @@ pub fn run_benchmark(app: AppHandle, state: State<AppState>) -> Result<(), Strin
         return Err(format!("Destination does not exist: {}", dest.display()));
     }
 
+    let cancel = state.bench_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+
     let _ = app.emit("benchmark://status", serde_json::json!({ "state": "running" }));
 
     std::thread::spawn(move || {
-        let result = crate::benchmark::DiskBenchmark::new(dest, None).run();
+        let result = crate::benchmark::DiskBenchmark::new(dest, None).run(&cancel);
         match result {
             Ok(r) => {
                 // Persist the auto-tuned values into the live config.
@@ -134,9 +158,14 @@ pub fn run_benchmark(app: AppHandle, state: State<AppState>) -> Result<(), Strin
                 );
             }
             Err(e) => {
+                let state = if e == crate::benchmark::runner::BENCH_CANCELLED {
+                    "cancelled"
+                } else {
+                    "failed"
+                };
                 let _ = app.emit(
                     "benchmark://status",
-                    serde_json::json!({ "state": "failed", "message": e }),
+                    serde_json::json!({ "state": state, "message": e }),
                 );
             }
         }
@@ -217,8 +246,12 @@ pub fn resume(state: State<AppState>) {
     }
 }
 
+/// Stop whatever is in progress: cancels the directory scan, the benchmark, and
+/// any running copy. Safe to call in any phase.
 #[tauri::command]
 pub fn cancel(state: State<AppState>) {
+    state.scan_cancel.store(true, Ordering::SeqCst);
+    state.bench_cancel.store(true, Ordering::SeqCst);
     if let Some(ctrl) = state.copy_control.lock().unwrap().as_ref() {
         ctrl.request_cancel();
     }

@@ -8,6 +8,10 @@
 use crate::config::Config;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Error message returned when a benchmark is cancelled via its cancel flag.
+pub const BENCH_CANCELLED: &str = "Benchmark cancelled";
 
 /// Status of the benchmark process.
 #[derive(Debug, Clone, PartialEq)]
@@ -102,12 +106,18 @@ impl DiskBenchmark {
         Self { source_dir, dest_dir }
     }
 
-    /// Run the benchmark and return the result.
+    /// Run the benchmark and return the result. `cancel` is polled between test
+    /// sizes so a long benchmark can be aborted; on cancellation this returns
+    /// `Err(BENCH_CANCELLED)`.
     /// On non-Windows, returns a default result since we cannot test CopyFileExW.
-    pub fn run(&self) -> Result<BenchmarkResult, String> {
+    pub fn run(&self, cancel: &AtomicBool) -> Result<BenchmarkResult, String> {
         // Ensure destination directory exists and is writable.
         if !self.dest_dir.exists() {
             return Err(format!("Destination {:?} does not exist", self.dest_dir));
+        }
+
+        if cancel.load(Ordering::Relaxed) {
+            return Err(BENCH_CANCELLED.to_string());
         }
 
         // Check free space (need at least 200 MiB for test files).
@@ -122,10 +132,13 @@ impl DiskBenchmark {
         let volume_serial = get_volume_serial(&self.dest_dir);
 
         #[cfg(windows)]
-        let result = self.run_windows_benchmark(&volume_serial)?;
+        let result = self.run_windows_benchmark(&volume_serial, cancel)?;
 
         #[cfg(not(windows))]
-        let result = self.run_stub_benchmark(&volume_serial)?;
+        let result = {
+            let _ = cancel;
+            self.run_stub_benchmark(&volume_serial)?
+        };
 
         result.save_to_cache()?;
         Ok(result)
@@ -146,7 +159,11 @@ impl DiskBenchmark {
     /// Real Windows benchmark: writes test files of various sizes and measures
     /// buffered vs unbuffered copy throughput to find the crossover point.
     #[cfg(windows)]
-    fn run_windows_benchmark(&self, volume_serial: &str) -> Result<BenchmarkResult, String> {
+    fn run_windows_benchmark(
+        &self,
+        volume_serial: &str,
+        cancel: &AtomicBool,
+    ) -> Result<BenchmarkResult, String> {
         use std::time::Instant;
 
         // Test file sizes: 256 KiB, 1 MiB, 4 MiB, 8 MiB, 16 MiB, 32 MiB, 64 MiB.
@@ -176,6 +193,11 @@ impl DiskBenchmark {
         let mut crossover_threshold = 16 * 1024 * 1024u64; // Default if we cannot determine.
 
         for &size in &test_sizes {
+            // Allow the user to abort between sizes.
+            if cancel.load(Ordering::Relaxed) {
+                return Err(BENCH_CANCELLED.to_string());
+            }
+
             // Write a test file filled with pseudo-random data.
             let src_path = test_dir.join(format!("bench_src_{}.bin", size));
             let dst_buffered = test_dir.join(format!("bench_buf_{}.bin", size));

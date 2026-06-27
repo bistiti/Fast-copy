@@ -3,6 +3,7 @@
 // propagates to all its children.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A node in the source tree. Can be a file or a directory with children.
 #[derive(Debug, Clone)]
@@ -35,50 +36,6 @@ impl SourceNode {
             included: true,
             children: Vec::new(),
             size,
-        }
-    }
-
-    /// Create a directory node by scanning its contents recursively.
-    /// Errors during scanning are silently skipped (the directory will appear empty).
-    pub fn directory(path: PathBuf) -> Self {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.to_string_lossy().to_string());
-
-        let mut children = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&path) {
-            let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-            // Sort: directories first, then alphabetical.
-            entries.sort_by(|a, b| {
-                let a_dir = a.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                let b_dir = b.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                b_dir.cmp(&a_dir).then_with(|| {
-                    a.file_name()
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .cmp(&b.file_name().to_string_lossy().to_lowercase())
-                })
-            });
-
-            for entry in entries {
-                let entry_path = entry.path();
-                if entry_path.is_dir() {
-                    children.push(SourceNode::directory(entry_path));
-                } else {
-                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    children.push(SourceNode::file(entry_path, size));
-                }
-            }
-        }
-
-        Self {
-            name,
-            path,
-            is_dir: true,
-            included: true,
-            children,
-            size: 0,
         }
     }
 
@@ -166,11 +123,6 @@ impl SourceList {
         }
     }
 
-    /// Add a directory (recursively scanned) to the source list.
-    pub fn add_directory(&mut self, path: PathBuf) {
-        self.roots.push(SourceNode::directory(path));
-    }
-
     /// Total included files across all roots.
     pub fn total_included_files(&self) -> usize {
         self.roots.iter().map(|r| r.count_included_files()).sum()
@@ -214,6 +166,75 @@ impl SourceList {
     pub fn is_empty(&self) -> bool {
         self.roots.is_empty()
     }
+}
+
+/// Recursively scan a directory into a SourceNode, aborting early if `cancel`
+/// is set. Returns `None` if the scan was cancelled (at any depth) so callers
+/// can discard a partial tree. Designed to run on a background thread.
+pub fn scan_directory(path: PathBuf, cancel: &AtomicBool) -> Option<SourceNode> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+    let mut children = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&path) {
+        let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        // Sort: directories first, then alphabetical (matches SourceNode::directory).
+        entries.sort_by(|a, b| {
+            let a_dir = a.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let b_dir = b.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            b_dir.cmp(&a_dir).then_with(|| {
+                a.file_name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .cmp(&b.file_name().to_string_lossy().to_lowercase())
+            })
+        });
+
+        for entry in entries {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                children.push(scan_directory(entry_path, cancel)?);
+            } else {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                children.push(SourceNode::file(entry_path, size));
+            }
+        }
+    }
+
+    Some(SourceNode {
+        name,
+        path,
+        is_dir: true,
+        included: true,
+        children,
+        size: 0,
+    })
+}
+
+/// Scan a mix of file and directory paths (used by drag-and-drop). Returns
+/// `None` if cancelled. Files are classified by `is_dir()` here.
+pub fn scan_paths(paths: Vec<PathBuf>, cancel: &AtomicBool) -> Option<Vec<SourceNode>> {
+    let mut nodes = Vec::new();
+    for p in paths {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        if p.is_dir() {
+            nodes.push(scan_directory(p, cancel)?);
+        } else if let Ok(meta) = std::fs::metadata(&p) {
+            nodes.push(SourceNode::file(p, meta.len()));
+        }
+    }
+    Some(nodes)
 }
 
 /// Compute the destination path for a source file, preserving relative structure.

@@ -58,14 +58,33 @@ export async function pickFiles() {
 export async function pickFolder() {
   const dir = await open({ directory: true, title: "Add folder" });
   if (!dir || Array.isArray(dir)) return;
-  const tree = await guard(() => invoke<Tree>("add_directory", { path: dir }));
-  if (tree) store().setTree(tree);
+  await addDirectory(dir);
+}
+
+export async function addDirectory(path: string) {
+  // The backend scans off the main thread; show the spinner while we wait.
+  store().setScanning(true);
+  try {
+    const tree = await invoke<Tree>("add_directory", { path });
+    store().setTree(tree);
+  } catch (e) {
+    store().showToast(typeof e === "string" ? e : String(e));
+  } finally {
+    store().setScanning(false);
+  }
 }
 
 export async function addPaths(paths: string[]) {
   if (paths.length === 0) return;
-  const tree = await guard(() => invoke<Tree>("add_paths", { paths }));
-  if (tree) store().setTree(tree);
+  store().setScanning(true);
+  try {
+    const tree = await invoke<Tree>("add_paths", { paths });
+    store().setTree(tree);
+  } catch (e) {
+    store().showToast(typeof e === "string" ? e : String(e));
+  } finally {
+    store().setScanning(false);
+  }
 }
 
 export async function toggleNode(path: string, included: boolean) {
@@ -127,7 +146,8 @@ export async function resumeCopy() {
   store().setPhase("copying");
 }
 
-export async function cancelCopy() {
+/// Stop whatever is running: scan, benchmark, or copy.
+export async function stop() {
   await guard(() => invoke("cancel"));
 }
 

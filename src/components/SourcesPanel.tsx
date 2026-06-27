@@ -2,21 +2,31 @@ import { clearSources, pickFiles, pickFolder, removeRoot } from "../api";
 import { useStore } from "../store";
 import { formatBytes } from "../utils/format";
 import { SourceTree } from "./SourceTree";
+import { Spinner } from "./Spinner";
 import { IconClose, IconFile, IconFolder, IconPlus } from "./icons";
 
 export function SourcesPanel() {
   const tree = useStore((s) => s.tree);
+  const scanning = useStore((s) => s.scanning);
 
   return (
     <section className="panel sources">
       <div className="panel-head">
         <h2>Sources</h2>
         <div className="panel-head-actions">
-          <button className="btn small" onClick={() => void pickFiles()}>
+          <button
+            className="btn small"
+            disabled={scanning}
+            onClick={() => void pickFiles()}
+          >
             <IconFile size={14} />
             Files
           </button>
-          <button className="btn small" onClick={() => void pickFolder()}>
+          <button
+            className="btn small"
+            disabled={scanning}
+            onClick={() => void pickFolder()}
+          >
             <IconFolder size={14} />
             Folder
           </button>
@@ -36,7 +46,9 @@ export function SourcesPanel() {
       </div>
 
       <div className="scroll tree-scroll">
-        {tree.roots.length === 0 ? (
+        {scanning ? (
+          <Spinner block size={28} label="Scanning files…" />
+        ) : tree.roots.length === 0 ? (
           <div className="empty">
             <IconPlus size={22} />
             <p>Add files or folders, or drop them here.</p>
