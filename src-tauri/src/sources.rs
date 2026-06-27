@@ -2,6 +2,7 @@
 // Each entry has a checkbox (included/excluded). Toggling a directory
 // propagates to all its children.
 
+use crate::scan_progress::ScanProgress;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -168,13 +169,46 @@ impl SourceList {
     }
 }
 
-/// Recursively scan a directory into a SourceNode, aborting early if `cancel`
-/// is set. Returns `None` if the scan was cancelled (at any depth) so callers
-/// can discard a partial tree. Designed to run on a background thread.
-pub fn scan_directory(path: PathBuf, cancel: &AtomicBool) -> Option<SourceNode> {
+/// Count the immediate subdirectories of `path` (one cheap read, no recursion).
+/// Used to seed the scan ETA's top-level total (T).
+pub fn count_top_level_subdirs(path: &Path) -> u64 {
+    std::fs::read_dir(path)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .count() as u64
+        })
+        .unwrap_or(0)
+}
+
+/// Read a directory's entries, sorted directories-first then case-insensitively.
+fn sorted_entries(path: &Path) -> Vec<std::fs::DirEntry> {
+    match std::fs::read_dir(path) {
+        Ok(rd) => {
+            let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+            entries.sort_by(|a, b| {
+                let a_dir = a.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let b_dir = b.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                b_dir.cmp(&a_dir).then_with(|| {
+                    a.file_name()
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .cmp(&b.file_name().to_string_lossy().to_lowercase())
+                })
+            });
+            entries
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Recursively scan a directory subtree, bumping `progress` per entry. Returns
+/// `None` if cancelled at any depth. Does NOT touch the top-level (T/C) counters.
+fn scan_subtree(path: PathBuf, cancel: &AtomicBool, progress: &ScanProgress) -> Option<SourceNode> {
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
+    progress.add_folder(&path.to_string_lossy());
 
     let name = path
         .file_name()
@@ -182,31 +216,17 @@ pub fn scan_directory(path: PathBuf, cancel: &AtomicBool) -> Option<SourceNode> 
         .unwrap_or_else(|| path.to_string_lossy().to_string());
 
     let mut children = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&path) {
-        let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-        // Sort: directories first, then alphabetical (matches SourceNode::directory).
-        entries.sort_by(|a, b| {
-            let a_dir = a.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            let b_dir = b.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            b_dir.cmp(&a_dir).then_with(|| {
-                a.file_name()
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .cmp(&b.file_name().to_string_lossy().to_lowercase())
-            })
-        });
-
-        for entry in entries {
-            if cancel.load(Ordering::Relaxed) {
-                return None;
-            }
-            let entry_path = entry.path();
-            if entry_path.is_dir() {
-                children.push(scan_directory(entry_path, cancel)?);
-            } else {
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                children.push(SourceNode::file(entry_path, size));
-            }
+    for entry in sorted_entries(&path) {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            children.push(scan_subtree(entry_path, cancel, progress)?);
+        } else {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            progress.add_file(size);
+            children.push(SourceNode::file(entry_path, size));
         }
     }
 
@@ -220,17 +240,85 @@ pub fn scan_directory(path: PathBuf, cancel: &AtomicBool) -> Option<SourceNode> 
     })
 }
 
-/// Scan a mix of file and directory paths (used by drag-and-drop). Returns
-/// `None` if cancelled. Files are classified by `is_dir()` here.
-pub fn scan_paths(paths: Vec<PathBuf>, cancel: &AtomicBool) -> Option<Vec<SourceNode>> {
+/// Scan a directory, treating its immediate subfolders as the top-level units
+/// for ETA: completing each one bumps `top_level_done` (C).
+fn scan_with_toplevel(
+    path: PathBuf,
+    cancel: &AtomicBool,
+    progress: &ScanProgress,
+) -> Option<SourceNode> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    progress.add_folder(&path.to_string_lossy());
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+    let mut children = Vec::new();
+    for entry in sorted_entries(&path) {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            let child = scan_subtree(entry_path, cancel, progress)?;
+            progress.complete_top_level();
+            children.push(child);
+        } else {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            progress.add_file(size);
+            children.push(SourceNode::file(entry_path, size));
+        }
+    }
+
+    Some(SourceNode {
+        name,
+        path,
+        is_dir: true,
+        included: true,
+        children,
+        size: 0,
+    })
+}
+
+/// Scan a single directory with live progress. Seeds T from the immediate
+/// subfolder count. Returns `None` if cancelled.
+pub fn scan_directory(
+    path: PathBuf,
+    cancel: &AtomicBool,
+    progress: &ScanProgress,
+) -> Option<SourceNode> {
+    progress.set_top_level_total(count_top_level_subdirs(&path));
+    scan_with_toplevel(path, cancel, progress)
+}
+
+/// Scan a mix of file and directory paths (drag-and-drop) with live progress.
+/// T = total immediate subfolders across all dropped directories. Returns
+/// `None` if cancelled.
+pub fn scan_paths(
+    paths: Vec<PathBuf>,
+    cancel: &AtomicBool,
+    progress: &ScanProgress,
+) -> Option<Vec<SourceNode>> {
+    let t: u64 = paths
+        .iter()
+        .filter(|p| p.is_dir())
+        .map(|p| count_top_level_subdirs(p))
+        .sum();
+    progress.set_top_level_total(t);
+
     let mut nodes = Vec::new();
     for p in paths {
         if cancel.load(Ordering::Relaxed) {
             return None;
         }
         if p.is_dir() {
-            nodes.push(scan_directory(p, cancel)?);
+            nodes.push(scan_with_toplevel(p, cancel, progress)?);
         } else if let Ok(meta) = std::fs::metadata(&p) {
+            progress.add_file(meta.len());
             nodes.push(SourceNode::file(p, meta.len()));
         }
     }

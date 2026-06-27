@@ -1,8 +1,8 @@
 import { clearSources, pickFiles, pickFolder, removeRoot } from "../api";
 import { useStore } from "../store";
 import { formatBytes } from "../utils/format";
+import { ScanProgressView } from "./ScanProgressView";
 import { SourceTree } from "./SourceTree";
-import { Spinner } from "./Spinner";
 import { IconClose, IconFile, IconFolder, IconPlus } from "./icons";
 
 export function SourcesPanel() {
@@ -47,7 +47,7 @@ export function SourcesPanel() {
 
       <div className="scroll tree-scroll">
         {scanning ? (
-          <Spinner block size={28} label="Scanning files…" />
+          <ScanProgressView />
         ) : tree.roots.length === 0 ? (
           <div className="empty">
             <IconPlus size={22} />

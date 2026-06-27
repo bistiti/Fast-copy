@@ -11,6 +11,7 @@ import type {
   Config,
   DonePayload,
   QueueEntryDto,
+  ScanProgressPayload,
   ThroughputPayload,
   Tree,
 } from "./types";
@@ -71,6 +72,7 @@ export async function addDirectory(path: string) {
     store().showToast(typeof e === "string" ? e : String(e));
   } finally {
     store().setScanning(false);
+    store().setScanProgress(null);
   }
 }
 
@@ -84,6 +86,7 @@ export async function addPaths(paths: string[]) {
     store().showToast(typeof e === "string" ? e : String(e));
   } finally {
     store().setScanning(false);
+    store().setScanProgress(null);
   }
 }
 
@@ -130,10 +133,18 @@ export async function runBenchmark() {
 
 export async function startCopy() {
   const conflictPolicy = store().conflictPolicy;
-  const entries = await guard(() =>
-    invoke<QueueEntryDto[]>("start_copy", { conflictPolicy }),
-  );
-  if (entries) store().beginCopy(entries);
+  // Show the progress UI + pressed button immediately, before the backend
+  // builds the queue — no silent gap.
+  store().setPhase("preparing");
+  try {
+    const entries = await invoke<QueueEntryDto[]>("start_copy", {
+      conflictPolicy,
+    });
+    store().beginCopy(entries);
+  } catch (e) {
+    store().setPhase("idle");
+    store().showToast(typeof e === "string" ? e : String(e));
+  }
 }
 
 export async function pauseCopy() {
@@ -173,6 +184,11 @@ export async function setupListeners() {
     s.onThroughput(e.payload),
   );
   await listen<DonePayload>("copy://done", (e) => s.onDone(e.payload));
+
+  await listen<ScanProgressPayload>("scan://progress", (e) => {
+    // Ignore late events after a scan has ended.
+    if (store().scanning) store().setScanProgress(e.payload);
+  });
 
   await listen<BenchmarkInfo>("benchmark://status", (e) => {
     s.setBenchmark(e.payload);

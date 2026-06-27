@@ -20,6 +20,7 @@ mod commands;
 mod config;
 mod dto;
 mod engine;
+mod scan_progress;
 mod sources;
 mod state;
 

@@ -1,6 +1,7 @@
 import { useStore } from "../store";
-import { formatBytes, formatDuration, formatSpeed } from "../utils/format";
+import { formatDuration } from "../utils/format";
 import { ThroughputChart } from "./ThroughputChart";
+import { IconClock, IconCopy, IconFile, IconFolder } from "./icons";
 
 export function ProgressDock() {
   const phase = useStore((s) => s.phase);
@@ -10,16 +11,44 @@ export function ProgressDock() {
 
   if (phase === "idle" && queue.length === 0) return null;
 
+  // Preparing: queue not built yet — show an indeterminate bar, never silent.
+  if (phase === "preparing") {
+    return (
+      <footer className="dock">
+        <div className="dock-bar">
+          <div className="gbar">
+            <div className="gbar-indet" />
+          </div>
+          <span className="gpct">Preparing…</span>
+        </div>
+      </footer>
+    );
+  }
+
   const totalBytes = progress?.totalBytes ?? 0;
   const totalCopied = progress?.totalCopied ?? 0;
-  const frac = totalBytes > 0 ? totalCopied / totalBytes : 0;
-  const pct = Math.min(100, Math.round(frac * 100));
-  const speed = progress?.speed ?? 0;
-  const eta = progress?.eta ?? -1;
+  const pct =
+    phase === "done"
+      ? 100
+      : totalBytes > 0
+        ? Math.min(100, Math.round((totalCopied / totalBytes) * 100))
+        : 0;
 
-  const done = progress?.filesDone ?? 0;
-  const failed = progress?.filesFailed ?? 0;
-  const skipped = progress?.filesSkipped ?? 0;
+  const elapsed = progress?.elapsedSecs ?? 0;
+  const eta = progress?.eta ?? -1;
+  const foldersDone = progress?.foldersDone ?? 0;
+  const foldersTotal = progress?.foldersTotal ?? 0;
+  const filesResolved =
+    (progress?.filesDone ?? 0) +
+    (progress?.filesFailed ?? 0) +
+    (progress?.filesSkipped ?? 0);
+  const filesTotal = queue.length;
+
+  const currentIndex = progress?.currentIndex ?? null;
+  const currentFile =
+    currentIndex != null
+      ? queue.find((r) => r.index === currentIndex)?.name
+      : undefined;
 
   return (
     <footer className="dock">
@@ -36,26 +65,30 @@ export function ProgressDock() {
       <div className="dock-stats">
         <div className="stat chart-stat">
           <ThroughputChart data={history} />
-          <span className="stat-speed mono">{formatSpeed(speed)}</span>
         </div>
-        <div className="stat">
-          <span className="stat-label">Copied</span>
-          <span className="mono">
-            {formatBytes(totalCopied)} / {formatBytes(totalBytes)}
+
+        <span className="readout mono" title="elapsed">
+          <IconClock size={15} />
+          {formatDuration(elapsed)}
+        </span>
+        <span className="readout mono dim" title="approximate time remaining">
+          <IconClock size={15} />~{formatDuration(eta)}
+        </span>
+        <span className="readout mono" title="folders done / total">
+          <IconFolder size={15} />
+          {foldersDone}/{foldersTotal}
+        </span>
+        <span className="readout mono" title="files done / total">
+          <IconFile size={15} />
+          {filesResolved}/{filesTotal}
+        </span>
+
+        {currentFile && (
+          <span className="readout current" title={currentFile}>
+            <IconCopy size={15} />
+            <span className="current-name">{currentFile}</span>
           </span>
-        </div>
-        <div className="stat">
-          <span className="stat-label">ETA</span>
-          <span className="mono">{formatDuration(eta)}</span>
-        </div>
-        <div className="stat">
-          <span className="stat-label">Files</span>
-          <span className="mono">
-            <span className="ok">{done}</span> ·{" "}
-            <span className={failed ? "err" : ""}>{failed}</span> ·{" "}
-            <span className="dim">{skipped}</span> / {queue.length}
-          </span>
-        </div>
+        )}
       </div>
     </footer>
   );

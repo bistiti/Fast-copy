@@ -12,7 +12,15 @@ use tauri::{AppHandle, Emitter};
 const SAMPLE_INTERVAL_MS: u64 = 300;
 
 /// Spawn the forwarder. Consumes `rx`; runs until `AllDone` or the channel closes.
-pub fn spawn(app: AppHandle, rx: Receiver<WorkerMessage>, sizes: Vec<u64>) {
+/// `folder_of[i]` maps file i to its folder; `folder_counts[f]` is the number of
+/// files in folder f — used to report folders-done/total.
+pub fn spawn(
+    app: AppHandle,
+    rx: Receiver<WorkerMessage>,
+    sizes: Vec<u64>,
+    folder_of: Vec<usize>,
+    folder_counts: Vec<u32>,
+) {
     std::thread::spawn(move || {
         let n = sizes.len();
         let total_bytes: u64 = sizes.iter().sum();
@@ -22,6 +30,12 @@ pub fn spawn(app: AppHandle, rx: Receiver<WorkerMessage>, sizes: Vec<u64>) {
         let mut files_failed: usize = 0;
         let mut files_skipped: usize = 0;
         let mut errors: Vec<String> = Vec::new();
+
+        let folders_total = folder_counts.len();
+        let mut folder_remaining = folder_counts;
+        let mut folders_done: usize = 0;
+        // Index of the most recently active file, for the "currently copying" line.
+        let mut current_index: Option<usize> = None;
 
         let start = Instant::now();
         let mut last_sample_time = start;
@@ -34,6 +48,7 @@ pub fn spawn(app: AppHandle, rx: Receiver<WorkerMessage>, sizes: Vec<u64>) {
                     bytes_copied,
                     ..
                 }) => {
+                    current_index = Some(index);
                     if let Some(slot) = per_file.get_mut(index) {
                         if bytes_copied > *slot {
                             total_copied += bytes_copied - *slot;
@@ -51,10 +66,12 @@ pub fn spawn(app: AppHandle, rx: Receiver<WorkerMessage>, sizes: Vec<u64>) {
                         *slot = *size;
                     }
                     files_done += 1;
+                    finish_in_folder(index, &folder_of, &mut folder_remaining, &mut folders_done);
                     let _ = app.emit("copy://file-done", json!({ "index": index }));
                 }
                 Ok(WorkerMessage::FileFailed { index, error }) => {
                     files_failed += 1;
+                    finish_in_folder(index, &folder_of, &mut folder_remaining, &mut folders_done);
                     errors.push(error.clone());
                     let _ = app.emit(
                         "copy://file-failed",
@@ -67,6 +84,7 @@ pub fn spawn(app: AppHandle, rx: Receiver<WorkerMessage>, sizes: Vec<u64>) {
                         *slot = *size;
                     }
                     files_skipped += 1;
+                    finish_in_folder(index, &folder_of, &mut folder_remaining, &mut folders_done);
                     let _ = app.emit("copy://file-skipped", json!({ "index": index }));
                 }
                 Ok(WorkerMessage::AllDone) => {
@@ -122,9 +140,13 @@ pub fn spawn(app: AppHandle, rx: Receiver<WorkerMessage>, sizes: Vec<u64>) {
                         "totalCopied": total_copied,
                         "totalBytes": total_bytes,
                         "eta": eta,
+                        "elapsedSecs": start.elapsed().as_secs_f64(),
                         "filesDone": files_done,
                         "filesFailed": files_failed,
                         "filesSkipped": files_skipped,
+                        "foldersDone": folders_done,
+                        "foldersTotal": folders_total,
+                        "currentIndex": current_index,
                     }),
                 );
                 last_sample_time = now;
@@ -132,6 +154,26 @@ pub fn spawn(app: AppHandle, rx: Receiver<WorkerMessage>, sizes: Vec<u64>) {
             }
         }
     });
+}
+
+/// Decrement a folder's remaining-file count when one of its files reaches a
+/// terminal state; count the folder done when it reaches zero.
+fn finish_in_folder(
+    index: usize,
+    folder_of: &[usize],
+    folder_remaining: &mut [u32],
+    folders_done: &mut usize,
+) {
+    if let Some(&f) = folder_of.get(index) {
+        if let Some(rem) = folder_remaining.get_mut(f) {
+            if *rem > 0 {
+                *rem -= 1;
+                if *rem == 0 {
+                    *folders_done += 1;
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
