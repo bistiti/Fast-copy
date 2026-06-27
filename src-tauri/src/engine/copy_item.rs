@@ -73,21 +73,36 @@ pub struct CopyItem {
 
 impl CopyItem {
     /// Create a new CopyItem, selecting the mode based on the given threshold.
-    /// Files strictly smaller than the threshold use buffered I/O;
-    /// files at or above the threshold use unbuffered I/O.
     pub fn new(source: PathBuf, destination: PathBuf, size: u64, threshold: u64) -> Self {
-        let mode = if size < threshold {
-            CopyMode::Buffered
-        } else {
-            CopyMode::Unbuffered
-        };
         Self {
             source,
             destination,
             size,
-            mode,
+            mode: select_mode(size, threshold),
             status: CopyStatus::Pending,
         }
+    }
+}
+
+/// Per-file strategy decision: files strictly below `threshold` use buffered I/O;
+/// files at or above it use unbuffered I/O. Pure function (no I/O), unit-tested.
+pub fn select_mode(size: u64, threshold: u64) -> CopyMode {
+    if size < threshold {
+        CopyMode::Buffered
+    } else {
+        CopyMode::Unbuffered
+    }
+}
+
+/// Given measured throughputs (bytes/sec) for the two strategies, prefer
+/// unbuffered only when it is strictly faster. Mirrors the benchmark's crossover
+/// decision. Pure function (no I/O), unit-tested.
+#[allow(dead_code)] // exercised by the unit tests / mirrors benchmark crossover
+pub fn faster_mode_by_throughput(buffered_bps: f64, unbuffered_bps: f64) -> CopyMode {
+    if unbuffered_bps > buffered_bps {
+        CopyMode::Unbuffered
+    } else {
+        CopyMode::Buffered
     }
 }
 
@@ -150,6 +165,37 @@ mod tests {
     fn test_mode_display() {
         assert_eq!(format!("{}", CopyMode::Buffered), "Buffered");
         assert_eq!(format!("{}", CopyMode::Unbuffered), "Unbuffered");
+    }
+
+    // ---- Test 5: buffered/unbuffered decision boundary (pure, no I/O) ----
+    #[test]
+    fn select_mode_threshold_boundary() {
+        let threshold = 16 * 1024 * 1024;
+        // Strictly below -> buffered.
+        assert_eq!(select_mode(0, threshold), CopyMode::Buffered);
+        assert_eq!(select_mode(threshold - 1, threshold), CopyMode::Buffered);
+        // At or above -> unbuffered.
+        assert_eq!(select_mode(threshold, threshold), CopyMode::Unbuffered);
+        assert_eq!(select_mode(threshold + 1, threshold), CopyMode::Unbuffered);
+    }
+
+    #[test]
+    fn faster_mode_by_throughput_picks_winner() {
+        // Unbuffered strictly faster -> choose unbuffered.
+        assert_eq!(
+            faster_mode_by_throughput(100.0e6, 250.0e6),
+            CopyMode::Unbuffered
+        );
+        // Buffered faster -> choose buffered.
+        assert_eq!(
+            faster_mode_by_throughput(300.0e6, 250.0e6),
+            CopyMode::Buffered
+        );
+        // Tie -> default to buffered (not strictly faster).
+        assert_eq!(
+            faster_mode_by_throughput(200.0e6, 200.0e6),
+            CopyMode::Buffered
+        );
     }
 
     #[test]
