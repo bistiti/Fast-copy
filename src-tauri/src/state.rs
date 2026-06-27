@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::engine::worker::CopyControl;
 use crate::sources::SourceList;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 /// Global application state. All fields are behind individual mutexes so that
@@ -17,6 +18,10 @@ pub struct AppState {
     pub destination: Mutex<Option<PathBuf>>,
     /// Control handle for the currently-running copy (pause/resume/cancel).
     pub copy_control: Mutex<Option<Arc<CopyControl>>>,
+    /// Cancellation flag for the in-progress directory scan.
+    pub scan_cancel: Arc<AtomicBool>,
+    /// Cancellation flag for the in-progress benchmark.
+    pub bench_cancel: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -26,6 +31,8 @@ impl AppState {
             sources: Mutex::new(SourceList::new()),
             destination: Mutex::new(None),
             copy_control: Mutex::new(None),
+            scan_cancel: Arc::new(AtomicBool::new(false)),
+            bench_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 }

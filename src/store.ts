@@ -10,6 +10,7 @@ import type {
   Phase,
   QueueEntryDto,
   QueueRow,
+  ScanProgressPayload,
   ThroughputPayload,
   Tree,
 } from "./types";
@@ -33,6 +34,8 @@ interface AppStore {
   conflictPolicy: ConflictPolicy;
   settingsOpen: boolean;
   toast: string | null;
+  scanning: boolean;
+  scanProgress: ScanProgressPayload | null;
 
   // --- plain setters ---
   setTree: (tree: Tree) => void;
@@ -43,6 +46,8 @@ interface AppStore {
   setConflictPolicy: (p: ConflictPolicy) => void;
   setSettingsOpen: (open: boolean) => void;
   showToast: (msg: string | null) => void;
+  setScanning: (scanning: boolean) => void;
+  setScanProgress: (p: ScanProgressPayload | null) => void;
 
   // --- copy lifecycle ---
   beginCopy: (entries: QueueEntryDto[]) => void;
@@ -81,6 +86,8 @@ export const useStore = create<AppStore>((set) => ({
   conflictPolicy: "overwrite",
   settingsOpen: false,
   toast: null,
+  scanning: false,
+  scanProgress: null,
 
   setTree: (tree) => set({ tree }),
   setDestination: (destination, freeSpace) => set({ destination, freeSpace }),
@@ -91,6 +98,8 @@ export const useStore = create<AppStore>((set) => ({
   setConflictPolicy: (conflictPolicy) => set({ conflictPolicy }),
   setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
   showToast: (toast) => set({ toast }),
+  setScanning: (scanning) => set({ scanning }),
+  setScanProgress: (scanProgress) => set({ scanProgress }),
 
   beginCopy: (entries) =>
     set({

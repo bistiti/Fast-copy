@@ -1,9 +1,4 @@
-import {
-  cancelCopy,
-  pauseCopy,
-  resumeCopy,
-  startCopy,
-} from "../api";
+import { pauseCopy, resumeCopy, startCopy, stop } from "../api";
 import { useStore } from "../store";
 import type { ConflictPolicy } from "../types";
 import { IconCopy, IconPause, IconPlay, IconStop } from "./icons";
@@ -18,13 +13,21 @@ export function ActionBar() {
   const phase = useStore((s) => s.phase);
   const tree = useStore((s) => s.tree);
   const destination = useStore((s) => s.destination);
+  const scanning = useStore((s) => s.scanning);
+  const benchRunning = useStore((s) => s.benchmark.state === "running");
   const conflictPolicy = useStore((s) => s.conflictPolicy);
   const setConflictPolicy = useStore((s) => s.setConflictPolicy);
   const clearCopy = useStore((s) => s.clearCopy);
 
+  const copying = phase === "copying" || phase === "paused";
+  // Anything the user might want to interrupt with Stop.
+  const busy = copying || scanning || benchRunning;
   const canCopy =
-    phase === "idle" && tree.totalFiles > 0 && destination.trim().length > 0;
-  const running = phase === "copying" || phase === "paused";
+    phase === "idle" &&
+    tree.totalFiles > 0 &&
+    destination.trim().length > 0 &&
+    !scanning &&
+    !benchRunning;
 
   return (
     <div className="actionbar">
@@ -51,12 +54,14 @@ export function ActionBar() {
           Resume
         </button>
       )}
-      {running && (
-        <button className="btn danger" onClick={() => void cancelCopy()}>
+
+      {busy && (
+        <button className="btn danger" onClick={() => void stop()}>
           <IconStop size={15} />
-          Cancel
+          Stop
         </button>
       )}
+
       {phase === "done" && (
         <button className="btn" onClick={() => clearCopy()}>
           Clear
@@ -69,10 +74,8 @@ export function ActionBar() {
         On conflict
         <select
           value={conflictPolicy}
-          disabled={running}
-          onChange={(e) =>
-            setConflictPolicy(e.target.value as ConflictPolicy)
-          }
+          disabled={copying}
+          onChange={(e) => setConflictPolicy(e.target.value as ConflictPolicy)}
         >
           {POLICIES.map((p) => (
             <option key={p.value} value={p.value}>

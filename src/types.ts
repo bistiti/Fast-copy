@@ -50,9 +50,29 @@ export interface Config {
   theme: string;
 }
 
-export type Phase = "idle" | "copying" | "paused" | "done";
+export type Phase = "idle" | "preparing" | "copying" | "paused" | "done";
 
-export type BenchmarkState = "notRun" | "running" | "completed" | "failed";
+export interface ScanEstimate {
+  etaSecs: number;
+  totalFilesEst: number;
+  totalBytesEst: number;
+}
+
+export interface ScanProgressPayload {
+  filesFound: number;
+  foldersFound: number;
+  bytesFound: number;
+  elapsedSecs: number;
+  currentPath: string;
+  estimate: ScanEstimate | null;
+}
+
+export type BenchmarkState =
+  | "notRun"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
 
 export interface BenchmarkInfo {
   state: BenchmarkState;
@@ -66,9 +86,13 @@ export interface ThroughputPayload {
   totalCopied: number;
   totalBytes: number;
   eta: number;
+  elapsedSecs: number;
   filesDone: number;
   filesFailed: number;
   filesSkipped: number;
+  foldersDone: number;
+  foldersTotal: number;
+  currentIndex: number | null;
 }
 
 export interface DonePayload {

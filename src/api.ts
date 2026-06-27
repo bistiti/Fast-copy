@@ -11,6 +11,7 @@ import type {
   Config,
   DonePayload,
   QueueEntryDto,
+  ScanProgressPayload,
   ThroughputPayload,
   Tree,
 } from "./types";
@@ -58,14 +59,35 @@ export async function pickFiles() {
 export async function pickFolder() {
   const dir = await open({ directory: true, title: "Add folder" });
   if (!dir || Array.isArray(dir)) return;
-  const tree = await guard(() => invoke<Tree>("add_directory", { path: dir }));
-  if (tree) store().setTree(tree);
+  await addDirectory(dir);
+}
+
+export async function addDirectory(path: string) {
+  // The backend scans off the main thread; show the spinner while we wait.
+  store().setScanning(true);
+  try {
+    const tree = await invoke<Tree>("add_directory", { path });
+    store().setTree(tree);
+  } catch (e) {
+    store().showToast(typeof e === "string" ? e : String(e));
+  } finally {
+    store().setScanning(false);
+    store().setScanProgress(null);
+  }
 }
 
 export async function addPaths(paths: string[]) {
   if (paths.length === 0) return;
-  const tree = await guard(() => invoke<Tree>("add_paths", { paths }));
-  if (tree) store().setTree(tree);
+  store().setScanning(true);
+  try {
+    const tree = await invoke<Tree>("add_paths", { paths });
+    store().setTree(tree);
+  } catch (e) {
+    store().showToast(typeof e === "string" ? e : String(e));
+  } finally {
+    store().setScanning(false);
+    store().setScanProgress(null);
+  }
 }
 
 export async function toggleNode(path: string, included: boolean) {
@@ -111,10 +133,18 @@ export async function runBenchmark() {
 
 export async function startCopy() {
   const conflictPolicy = store().conflictPolicy;
-  const entries = await guard(() =>
-    invoke<QueueEntryDto[]>("start_copy", { conflictPolicy }),
-  );
-  if (entries) store().beginCopy(entries);
+  // Show the progress UI + pressed button immediately, before the backend
+  // builds the queue — no silent gap.
+  store().setPhase("preparing");
+  try {
+    const entries = await invoke<QueueEntryDto[]>("start_copy", {
+      conflictPolicy,
+    });
+    store().beginCopy(entries);
+  } catch (e) {
+    store().setPhase("idle");
+    store().showToast(typeof e === "string" ? e : String(e));
+  }
 }
 
 export async function pauseCopy() {
@@ -127,7 +157,8 @@ export async function resumeCopy() {
   store().setPhase("copying");
 }
 
-export async function cancelCopy() {
+/// Stop whatever is running: scan, benchmark, or copy.
+export async function stop() {
   await guard(() => invoke("cancel"));
 }
 
@@ -153,6 +184,11 @@ export async function setupListeners() {
     s.onThroughput(e.payload),
   );
   await listen<DonePayload>("copy://done", (e) => s.onDone(e.payload));
+
+  await listen<ScanProgressPayload>("scan://progress", (e) => {
+    // Ignore late events after a scan has ended.
+    if (store().scanning) store().setScanProgress(e.payload);
+  });
 
   await listen<BenchmarkInfo>("benchmark://status", (e) => {
     s.setBenchmark(e.payload);

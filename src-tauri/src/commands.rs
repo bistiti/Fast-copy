@@ -6,10 +6,13 @@ use crate::dto::{DestinationInfo, QueueEntryDto, TreeDto};
 use crate::engine::copy_item::{long_path, CopyItem};
 use crate::engine::worker::{ConflictPolicy, CopyOrchestrator};
 use crate::engine::CopyJournal;
-use crate::sources::compute_destination;
+use crate::scan_progress::{estimate, ScanProgress};
+use crate::sources::{compute_destination, scan_directory, scan_paths};
 use crate::state::AppState;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 // ---- Source tree ----
@@ -23,27 +26,115 @@ pub fn add_sources(paths: Vec<String>, state: State<AppState>) -> TreeDto {
     TreeDto::from_list(&sources)
 }
 
-#[tauri::command]
-pub fn add_directory(path: String, state: State<AppState>) -> TreeDto {
-    let mut sources = state.sources.lock().unwrap();
-    sources.add_directory(PathBuf::from(path));
-    TreeDto::from_list(&sources)
+/// Emit one `scan://progress` event from the current counters.
+fn emit_scan_progress(app: &AppHandle, p: &ScanProgress, elapsed: f64) {
+    let files = p.files_found.load(Ordering::Relaxed);
+    let folders = p.folders_found.load(Ordering::Relaxed);
+    let bytes = p.bytes_found.load(Ordering::Relaxed);
+    let c = p.top_level_done.load(Ordering::Relaxed);
+    let t = p.top_level_total.load(Ordering::Relaxed);
+    let current = p.current_path.lock().map(|s| s.clone()).unwrap_or_default();
+
+    let est = estimate(files, bytes, c, t, elapsed).map(|e| {
+        serde_json::json!({
+            "etaSecs": e.eta_secs,
+            "totalFilesEst": e.total_files_est,
+            "totalBytesEst": e.total_bytes_est,
+        })
+    });
+
+    let _ = app.emit(
+        "scan://progress",
+        serde_json::json!({
+            "filesFound": files,
+            "foldersFound": folders,
+            "bytesFound": bytes,
+            "elapsedSecs": elapsed,
+            "currentPath": current,
+            "estimate": est,
+        }),
+    );
 }
 
-/// Add a mix of files and folders (used by drag-and-drop, where the frontend
-/// doesn't know which paths are directories). Each path is classified here.
+/// Spawn the ~150 ms sampler that emits `scan://progress` until `stop` is set.
+fn spawn_scan_sampler(app: AppHandle, progress: Arc<ScanProgress>, stop: Arc<AtomicBool>, start: Instant) {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            emit_scan_progress(&app, &progress, start.elapsed().as_secs_f64());
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+    });
+}
+
+/// Add a directory. Async so Tauri runs it off the main thread; the recursive
+/// filesystem scan happens on a blocking worker so the UI stays responsive, and
+/// it can be aborted via the shared scan-cancel flag (Stop button). A sampler
+/// streams `scan://progress` events while it runs.
 #[tauri::command]
-pub fn add_paths(paths: Vec<String>, state: State<AppState>) -> TreeDto {
+pub async fn add_directory(
+    path: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<TreeDto, String> {
+    let cancel = state.scan_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+
+    let progress = Arc::new(ScanProgress::new());
+    let stop = Arc::new(AtomicBool::new(false));
+    let start = Instant::now();
+    spawn_scan_sampler(app.clone(), progress.clone(), stop.clone(), start);
+
+    let p = PathBuf::from(path);
+    let c = cancel.clone();
+    let prog = progress.clone();
+    let node = tauri::async_runtime::spawn_blocking(move || scan_directory(p, &c, &prog))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    stop.store(true, Ordering::SeqCst);
+    emit_scan_progress(&app, &progress, start.elapsed().as_secs_f64());
+
     let mut sources = state.sources.lock().unwrap();
-    for p in paths {
-        let pb = PathBuf::from(p);
-        if pb.is_dir() {
-            sources.add_directory(pb);
-        } else {
-            sources.add_file(pb);
+    // `None` means the scan was cancelled: leave the tree unchanged.
+    if let Some(node) = node {
+        sources.roots.push(node);
+    }
+    Ok(TreeDto::from_list(&sources))
+}
+
+/// Add a mix of files and folders (used by drag-and-drop). Scanning runs
+/// off-thread, is cancellable, and streams progress like `add_directory`.
+#[tauri::command]
+pub async fn add_paths(
+    paths: Vec<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<TreeDto, String> {
+    let cancel = state.scan_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+
+    let progress = Arc::new(ScanProgress::new());
+    let stop = Arc::new(AtomicBool::new(false));
+    let start = Instant::now();
+    spawn_scan_sampler(app.clone(), progress.clone(), stop.clone(), start);
+
+    let pbs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+    let c = cancel.clone();
+    let prog = progress.clone();
+    let nodes = tauri::async_runtime::spawn_blocking(move || scan_paths(pbs, &c, &prog))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    stop.store(true, Ordering::SeqCst);
+    emit_scan_progress(&app, &progress, start.elapsed().as_secs_f64());
+
+    let mut sources = state.sources.lock().unwrap();
+    if let Some(nodes) = nodes {
+        for n in nodes {
+            sources.roots.push(n);
         }
     }
-    TreeDto::from_list(&sources)
+    Ok(TreeDto::from_list(&sources))
 }
 
 #[tauri::command]
@@ -110,10 +201,13 @@ pub fn run_benchmark(app: AppHandle, state: State<AppState>) -> Result<(), Strin
         return Err(format!("Destination does not exist: {}", dest.display()));
     }
 
+    let cancel = state.bench_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+
     let _ = app.emit("benchmark://status", serde_json::json!({ "state": "running" }));
 
     std::thread::spawn(move || {
-        let result = crate::benchmark::DiskBenchmark::new(dest, None).run();
+        let result = crate::benchmark::DiskBenchmark::new(dest, None).run(&cancel);
         match result {
             Ok(r) => {
                 // Persist the auto-tuned values into the live config.
@@ -134,9 +228,14 @@ pub fn run_benchmark(app: AppHandle, state: State<AppState>) -> Result<(), Strin
                 );
             }
             Err(e) => {
+                let state = if e == crate::benchmark::runner::BENCH_CANCELLED {
+                    "cancelled"
+                } else {
+                    "failed"
+                };
                 let _ = app.emit(
                     "benchmark://status",
-                    serde_json::json!({ "state": "failed", "message": e }),
+                    serde_json::json!({ "state": state, "message": e }),
                 );
             }
         }
@@ -147,11 +246,13 @@ pub fn run_benchmark(app: AppHandle, state: State<AppState>) -> Result<(), Strin
 
 // ---- Copy ----
 
+/// Async so the queue construction runs off the main thread (the frontend has
+/// already shown its `preparing` UI by the time this is awaited — no silent gap).
 #[tauri::command]
-pub fn start_copy(
+pub async fn start_copy(
     conflict_policy: ConflictPolicy,
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<QueueEntryDto>, String> {
     let dest_base = state
         .destination
@@ -164,7 +265,9 @@ pub fn start_copy(
     let threshold = config.size_threshold_bytes;
 
     // Build the queue while holding the sources lock (needed for relative paths).
-    let (items, entries, sizes) = {
+    // `folder_of[i]` is the folder index of item i; `folder_counts[f]` is the
+    // number of files in folder f (a folder = a source parent directory).
+    let (items, entries, sizes, folder_of, folder_counts) = {
         let sources = state.sources.lock().unwrap();
         let files = sources.collect_all_included();
         if files.is_empty() {
@@ -174,6 +277,9 @@ pub fn start_copy(
         let mut items = Vec::with_capacity(files.len());
         let mut entries = Vec::with_capacity(files.len());
         let mut sizes = Vec::with_capacity(files.len());
+        let mut folder_of = Vec::with_capacity(files.len());
+        let mut folder_index: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
+        let mut folder_counts: Vec<u32> = Vec::new();
 
         for (idx, (src_path, size)) in files.iter().enumerate() {
             let dest_file = compute_destination(src_path, &sources, &dest_base);
@@ -182,11 +288,24 @@ pub fn start_copy(
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
+
+            // Group by source parent directory.
+            let parent = src_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            let f = *folder_index.entry(parent).or_insert_with(|| {
+                folder_counts.push(0);
+                folder_counts.len() - 1
+            });
+            folder_counts[f] += 1;
+            folder_of.push(f);
+
             entries.push(QueueEntryDto::new(idx, name, *size, item.mode));
             sizes.push(*size);
             items.push(item);
         }
-        (items, entries, sizes)
+        (items, entries, sizes, folder_of, folder_counts)
     };
 
     let journal_path = CopyJournal::default_path();
@@ -195,7 +314,7 @@ pub fn start_copy(
         .map_err(|e| format!("Failed to start copy: {}", e))?;
 
     // Only start forwarding once the orchestrator is ready.
-    bridge::spawn(app.clone(), rx, sizes);
+    bridge::spawn(app.clone(), rx, sizes, folder_of, folder_counts);
 
     *state.copy_control.lock().unwrap() = Some(Arc::clone(&orchestrator.control));
     orchestrator.start(items);
@@ -217,8 +336,12 @@ pub fn resume(state: State<AppState>) {
     }
 }
 
+/// Stop whatever is in progress: cancels the directory scan, the benchmark, and
+/// any running copy. Safe to call in any phase.
 #[tauri::command]
 pub fn cancel(state: State<AppState>) {
+    state.scan_cancel.store(true, Ordering::SeqCst);
+    state.bench_cancel.store(true, Ordering::SeqCst);
     if let Some(ctrl) = state.copy_control.lock().unwrap().as_ref() {
         ctrl.request_cancel();
     }
