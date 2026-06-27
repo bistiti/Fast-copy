@@ -29,9 +29,13 @@ needs to run once.
 - **Pause, cancel, and resume**: via CopyFileExW progress callback and journal
 - **Long path support**: paths prefixed with `\\?\` for >260 character support
 - **Drag-and-drop**: drop files/folders onto the window to add sources
-- **Dark theme GUI**: clean two-panel layout with monospace stats display
-- **Portable**: single executable, no installer, no external dependencies
-- **Configurable**: all thresholds and buffer sizes tunable via UI or JSON file
+- **Modern web UI** (Tauri 2 + React): sleek two-pane dashboard with a sticky
+  progress dock, live throughput sparkline, per-file ETA, and a **light/dark
+  theme toggle** (persisted)
+- **Conflict handling**: choose Overwrite, Skip existing, or Keep both (rename)
+- **Completion summary**: totals, duration, average speed, and an error list
+- **Configurable**: all thresholds and buffer sizes tunable via the Settings
+  dialog or the JSON file
 
 ## Screenshot layout
 
@@ -56,44 +60,33 @@ needs to run once.
 
 ## Building
 
-### Native Windows build
+Fast-copy is a Tauri 2 app: a Rust backend (`src-tauri/`) plus a React + Vite
+frontend. Build on **Windows** — Tauri apps cannot be cross-compiled to Windows
+from Linux in this setup.
 
-```
-cargo build --release
-```
+### Prerequisites
 
-The output is `target\release\fast-copy.exe`.
+- Node.js 18+ and npm
+- Rust toolchain via rustup (the pinned version in
+  `src-tauri/rust-toolchain.toml` installs automatically)
+- WebView2 runtime (ships with Windows 10/11)
 
-### Cross-compilation from Linux (Arch/CachyOS)
-
-1. Install the MinGW-w64 cross-compiler:
-
-```bash
-sudo pacman -S mingw-w64-gcc
-```
-
-2. Add the Windows target to Rust:
+### Commands
 
 ```bash
-rustup target add x86_64-pc-windows-gnu
+npm ci              # install frontend dependencies
+npm run tauri dev   # run the app in development (hot reload)
+npm run tauri build # produce the release artifacts
 ```
 
-3. Build:
+`npm run tauri build` produces:
 
-```bash
-cargo build --release --target x86_64-pc-windows-gnu
-```
+- the portable executable at `src-tauri/target/release/fast-copy.exe`
+- an NSIS installer at `src-tauri/target/release/bundle/nsis/*-setup.exe`
 
-The output is `target/x86_64-pc-windows-gnu/release/fast-copy.exe`.
-
-The `.cargo/config.toml` file already configures the MinGW linker for the
-Windows target.
-
-### Static CRT
-
-The release profile uses LTO and strips symbols. On Windows with the `gnu`
-target, the CRT is statically linked by default. For MSVC targets, add
-`-C target-feature=+crt-static` to RUSTFLAGS.
+The helper script `./build.sh [deps|dev|build|test]` wraps these. CI
+(`.github/workflows/`) builds and tests on `windows-latest` for every push and
+publishes release artifacts on version tags.
 
 ## Usage
 
@@ -154,8 +147,12 @@ for resume capability.
 ## Known limitations
 
 - **Windows only**: the copy engine uses Win32 APIs (CopyFileExW,
-  COPY_FILE_NO_BUFFERING). The project compiles on Linux for development and
-  testing, but the copy engine is a stub that uses `std::fs::copy`.
+  COPY_FILE_NO_BUFFERING) and the UI uses WebView2. On non-Windows the engine
+  compiles as a stub for development; the shipped app targets Windows 10/11 x64.
+
+- **Requires WebView2**: the UI renders in the system WebView2 runtime, which is
+  preinstalled on Windows 10/11. The portable exe is not fully standalone in the
+  sense that it relies on this evergreen runtime.
 
 - **ACLs are NOT preserved**: `CopyFileExW` preserves timestamps and standard
   file attributes, but does not copy NTFS ACLs (Access Control Lists). If you
@@ -180,24 +177,33 @@ for resume capability.
 ## Project structure
 
 ```
-src/
-  main.rs              -- Entry point, eframe launch
-  config.rs            -- Configuration (load/save/defaults)
-  engine/
-    mod.rs             -- Engine module root
-    copy_item.rs       -- CopyItem, CopyMode, CopyStatus types
-    journal.rs         -- Resume journal (completed file tracking)
-    worker.rs          -- Thread pool orchestrator
-    win32.rs           -- Windows CopyFileExW implementation
-    stub.rs            -- Non-Windows stub for cross-compilation
-  benchmark/
-    mod.rs             -- Benchmark module root
-    runner.rs          -- Disk benchmark runner and cache
-  gui/
-    mod.rs             -- GUI module root
-    app.rs             -- Main eframe::App, UI layout and logic
-    source_tree.rs     -- Source file/folder tree with checkboxes
-    style.rs           -- Dark theme, colors, formatting helpers
+src-tauri/                 -- Rust backend
+  src/
+    main.rs                -- Tauri builder; registers commands + state
+    state.rs               -- Managed AppState (config, sources, dest, control)
+    commands.rs            -- #[tauri::command] IPC handlers
+    bridge.rs              -- Forwards engine events -> Tauri events + throughput
+    dto.rs                 -- Serde DTOs shared with the frontend
+    sources.rs             -- Source file/folder tree (data model)
+    config.rs              -- Configuration (load/save/defaults)
+    engine/
+      copy_item.rs         -- CopyItem, CopyMode, CopyStatus
+      journal.rs           -- Resume journal (completed file tracking)
+      worker.rs            -- Thread pool orchestrator + ConflictPolicy
+      win32.rs             -- Windows CopyFileExW implementation
+      stub.rs              -- Non-Windows stub
+    benchmark/
+      runner.rs            -- Disk benchmark runner and cache
+  tauri.conf.json, build.rs, capabilities/, icons/
+
+src/                       -- React + Vite frontend
+  main.tsx, App.tsx, styles.css
+  store.ts                 -- Zustand store
+  api.ts                   -- invoke() wrappers + event listeners
+  types.ts, utils/format.ts
+  components/               -- TopBar, SourcesPanel, SourceTree, QueuePanel,
+                              BenchmarkChip, ActionBar, ProgressDock,
+                              ThroughputChart, SettingsModal, CompletionSummary
 ```
 
 ## License

@@ -1,11 +1,12 @@
-# GitHub Actions workflow that builds the portable Windows executable and
-# publishes a GitHub Release whenever a version tag (v*) is pushed.
+# Builds the Tauri desktop app on Windows and publishes a GitHub Release when a
+# version tag (v*) is pushed. Can also be run manually (workflow_dispatch).
 #
-# It can also be triggered manually from the Actions tab (workflow_dispatch),
-# in which case it builds and uploads to a release named after the chosen tag.
+# Two artifacts are attached to the release:
+#   - the portable executable (fast-copy.exe)
+#   - the NSIS installer (Fast-copy_<version>_x64-setup.exe)
 #
-# The release artifact is a single, statically-linked (static CRT) .exe that
-# needs no installer and no Visual C++ redistributable.
+# WebView2 is the evergreen runtime already present on Windows 10/11, so it is
+# not embedded; the app uses the system WebView2.
 
 name: Release
 
@@ -16,12 +17,10 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (e.g. v0.1.0). Must already exist or will be created from the current ref."
+        description: "Tag to release (e.g. v0.1.0)."
         required: true
         default: "v0.1.0"
 
-# The default GITHUB_TOKEN needs write access to create the release and
-# upload assets.
 permissions:
   contents: write
 
@@ -33,20 +32,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # rust-toolchain.toml pins the exact compiler version, so rustup will
-      # auto-install it on the first cargo invocation. We add the MSVC target
-      # explicitly to be safe.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # rust-toolchain.toml (in src-tauri) pins the compiler; rustup installs it
+      # on first use. Show it for logging.
       - name: Show Rust version
+        working-directory: src-tauri
         run: rustup show
 
-      # Build the release binary with a static CRT so the .exe is fully
-      # portable (no VC++ runtime dependency). The default target on
-      # windows-latest is x86_64-pc-windows-msvc.
-      - name: Build release (static CRT)
-        shell: bash
-        env:
-          RUSTFLAGS: "-C target-feature=+crt-static"
-        run: cargo build --release
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Frontend unit tests
+        run: npm test
+
+      # Build the frontend before cargo tests: generate_context! embeds dist/.
+      - name: Build frontend
+        run: npm run build
+
+      - name: Cargo tests
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Build Tauri app
+        run: npm run tauri build
 
       - name: Determine tag name
         id: tag
@@ -58,21 +75,21 @@ jobs:
             echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           fi
 
-      # Publish the release and attach the .exe. softprops/action-gh-release
-      # creates the release if it does not exist and uploads the binary.
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
           name: Fast-copy ${{ steps.tag.outputs.name }}
           generate_release_notes: true
-          files: target/release/fast-copy.exe
+          files: |
+            src-tauri/target/release/fast-copy.exe
+            src-tauri/target/release/bundle/nsis/*-setup.exe
           body: |
-            Portable Windows x64 build of Fast-copy.
+            Windows x64 build of Fast-copy (Tauri UI).
 
-            Download `fast-copy.exe` below and run it directly: no installer,
-            no Visual C++ redistributable required (the C runtime is statically
-            linked).
+            - `fast-copy.exe` — portable executable. Requires the WebView2
+              runtime, which ships with Windows 10/11.
+            - `*-setup.exe` — NSIS installer.
 
             See the README for usage, the benchmark explanation, and known
             limitations (notably: ACLs are not preserved).

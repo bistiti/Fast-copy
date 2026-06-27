@@ -6,9 +6,49 @@ use crate::config::Config;
 use crate::engine::copy_item::CopyItem;
 use crate::engine::journal::CopyJournal;
 use crossbeam_channel::Sender;
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// How to handle a destination file that already exists on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ConflictPolicy {
+    /// Overwrite the existing file (CopyFileExW default behavior).
+    #[default]
+    Overwrite,
+    /// Leave the existing file in place; report the source as skipped.
+    Skip,
+    /// Copy to a uniquely-renamed destination ("name (1).ext", ...).
+    Rename,
+}
+
+/// Given a destination that already exists, find a unique sibling path by
+/// appending " (1)", " (2)", ... before the extension. Preserves any \\?\ prefix.
+fn unique_destination(path: &Path) -> PathBuf {
+    let parent = path.parent().map(Path::to_path_buf);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = path.extension().map(|e| e.to_string_lossy().to_string());
+
+    for n in 1..u64::MAX {
+        let name = match &ext {
+            Some(ext) => format!("{} ({}).{}", stem, n, ext),
+            None => format!("{} ({})", stem, n),
+        };
+        let candidate = match &parent {
+            Some(p) => p.join(&name),
+            None => PathBuf::from(&name),
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path.to_path_buf()
+}
 
 /// Messages sent from the worker threads back to the UI.
 #[derive(Debug, Clone)]
@@ -89,6 +129,7 @@ pub struct CopyOrchestrator {
     pub control: Arc<CopyControl>,
     pub journal: Arc<Mutex<CopyJournal>>,
     pub message_tx: Sender<WorkerMessage>,
+    pub conflict_policy: ConflictPolicy,
 }
 
 impl CopyOrchestrator {
@@ -96,6 +137,7 @@ impl CopyOrchestrator {
         config: Config,
         journal_path: PathBuf,
         message_tx: Sender<WorkerMessage>,
+        conflict_policy: ConflictPolicy,
     ) -> Result<Self, String> {
         let journal = CopyJournal::open(journal_path)?;
         Ok(Self {
@@ -103,6 +145,7 @@ impl CopyOrchestrator {
             control: Arc::new(CopyControl::new()),
             journal: Arc::new(Mutex::new(journal)),
             message_tx,
+            conflict_policy,
         })
     }
 
@@ -115,6 +158,7 @@ impl CopyOrchestrator {
         let journal = Arc::clone(&self.journal);
         let tx = self.message_tx.clone();
         let config = self.config.clone();
+        let conflict_policy = self.conflict_policy;
 
         // Build a work queue: (index, item) pairs.
         let work: Vec<(usize, CopyItem)> = items.into_iter().enumerate().collect();
@@ -147,7 +191,7 @@ impl CopyOrchestrator {
                         queue.next()
                     };
 
-                    let (index, item) = match task {
+                    let (index, mut item) = match task {
                         Some(t) => t,
                         None => break,
                     };
@@ -158,6 +202,22 @@ impl CopyOrchestrator {
                         if j.is_completed(&item.destination) {
                             let _ = tx.send(WorkerMessage::FileSkipped { index });
                             continue;
+                        }
+                    }
+
+                    // Apply the conflict policy for destinations that already exist.
+                    match conflict_policy {
+                        ConflictPolicy::Overwrite => {}
+                        ConflictPolicy::Skip => {
+                            if item.destination.exists() {
+                                let _ = tx.send(WorkerMessage::FileSkipped { index });
+                                continue;
+                            }
+                        }
+                        ConflictPolicy::Rename => {
+                            if item.destination.exists() {
+                                item.destination = unique_destination(&item.destination);
+                            }
                         }
                     }
 

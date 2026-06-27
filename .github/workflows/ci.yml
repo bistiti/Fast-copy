@@ -1,0 +1,46 @@
+# Continuous integration: type-check, test, and build the Tauri app on every
+# push and pull request (no release upload). Catches breakage early since the
+# project has no local build toolchain.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  check:
+    name: Build & test (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Show Rust version
+        working-directory: src-tauri
+        run: rustup show
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Frontend type-check & unit tests
+        run: |
+          npm run build
+          npm test
+
+      - name: Cargo check & tests
+        working-directory: src-tauri
+        run: |
+          cargo check
+          cargo test
