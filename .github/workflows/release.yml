@@ -36,7 +36,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
 
       # rust-toolchain.toml (in src-tauri) pins the compiler; rustup installs it
       # on first use. Show it for logging.
@@ -50,7 +49,7 @@ jobs:
           workspaces: src-tauri
 
       - name: Install frontend dependencies
-        run: npm ci
+        run: npm install
 
       - name: Frontend unit tests
         run: npm test

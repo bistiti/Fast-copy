@@ -9,7 +9,7 @@ echo.
 
 if not exist "node_modules" (
     echo Installing frontend dependencies...
-    call npm ci || goto :error
+    call npm install || goto :error
 )
 
 echo Running frontend unit tests...

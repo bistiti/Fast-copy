@@ -19,13 +19,13 @@ set -e
 
 case "${1:-build}" in
     deps)
-        npm ci
+        npm install
         ;;
     dev)
         npm run tauri dev
         ;;
     build)
-        npm ci
+        npm install
         npm run tauri build
         echo "Artifacts under src-tauri/target/release/ (exe) and"
         echo "src-tauri/target/release/bundle/nsis/ (installer)."
