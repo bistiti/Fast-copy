@@ -1,1 +1,18 @@
+# Rust
 /target
+src-tauri/target
+
+# Tauri generated
+src-tauri/gen
+
+# Node / frontend
+node_modules
+dist
+dist-ssr
+*.local
+
+# Brainstorm companion scratch
+.superpowers/
+
+# Editor
+.DS_Store

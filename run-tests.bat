@@ -1,45 +1,34 @@
 @echo off
-REM Test launcher for Fast-copy on Windows.
-REM Run this from the project root after building with: cargo build
-REM Or run the portable .exe directly: fast-copy.exe
+REM Test + dev launcher for Fast-copy (Tauri) on Windows.
+REM Requires Node.js + npm and the Rust toolchain.
 
 echo ============================================
-echo  Fast-copy Test Launcher
+echo  Fast-copy - Tauri dev launcher
 echo ============================================
 echo.
 
-REM Check if the exe exists in common locations
-if exist "target\release\fast-copy.exe" (
-    echo Found release build.
-    set EXE=target\release\fast-copy.exe
-) else if exist "target\debug\fast-copy.exe" (
-    echo Found debug build.
-    set EXE=target\debug\fast-copy.exe
-) else if exist "fast-copy.exe" (
-    echo Found portable exe.
-    set EXE=fast-copy.exe
-) else (
-    echo ERROR: fast-copy.exe not found.
-    echo Build first with: cargo build --release
-    echo Or place fast-copy.exe in this directory.
-    pause
-    exit /b 1
+if not exist "node_modules" (
+    echo Installing frontend dependencies...
+    call npm ci || goto :error
 )
 
-echo Launching: %EXE%
-echo.
-echo --- Quick test checklist ---
-echo  1. Set a destination folder (Browse or type path)
-echo  2. Add source files/folders (drag-and-drop or buttons)
-echo  3. Run Benchmark (optional, calibrates threshold)
-echo  4. Click Copy and verify:
-echo     - Small files show [Buffered] mode
-echo     - Large files show [Unbuffered] mode
-echo     - Progress bar, speed, ETA update correctly
-echo  5. Test Pause / Resume / Cancel
-echo  6. Close and relaunch to test resume (journal skip)
-echo  7. Check Settings panel (threshold, threads)
-echo ============================
-echo.
+echo Running frontend unit tests...
+call npm test || goto :error
 
-start "" "%EXE%"
+echo Running Rust tests...
+pushd src-tauri
+call cargo test || (popd & goto :error)
+popd
+
+echo.
+echo Tests passed. Launching the app in dev mode...
+echo (Close the window to stop. Use Ctrl+C in this console to exit Vite.)
+echo.
+call npm run tauri dev
+goto :eof
+
+:error
+echo.
+echo Build/test failed. See output above.
+pause
+exit /b 1

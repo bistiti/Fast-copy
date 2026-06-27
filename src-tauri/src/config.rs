@@ -23,6 +23,15 @@ pub struct Config {
 
     /// Maximum total memory budget for copy buffers across all threads (bytes).
     pub max_memory_bytes: u64,
+
+    /// UI theme preference: "dark" or "light". Persisted across restarts.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+/// Default theme when a config file predates the `theme` field.
+fn default_theme() -> String {
+    "dark".to_string()
 }
 
 impl Default for Config {
@@ -40,6 +49,7 @@ impl Default for Config {
             thread_count: threads,
             // 512 MiB memory ceiling.
             max_memory_bytes: 512 * 1024 * 1024,
+            theme: default_theme(),
         }
     }
 }

@@ -1,8 +1,8 @@
-// Source tree: data model for the left panel showing added source files/folders.
+// Source tree: data model for the source list showing added files/folders.
 // Each entry has a checkbox (included/excluded). Toggling a directory
 // propagates to all its children.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A node in the source tree. Can be a file or a directory with children.
 #[derive(Debug, Clone)]
@@ -88,6 +88,21 @@ impl SourceNode {
         for child in &mut self.children {
             child.set_included_recursive(included);
         }
+    }
+
+    /// Find the node whose path matches `target` and set its included state
+    /// (cascading to descendants). Returns true if a matching node was found.
+    pub fn set_included_for_path(&mut self, target: &Path, included: bool) -> bool {
+        if self.path == target {
+            self.set_included_recursive(included);
+            return true;
+        }
+        for child in &mut self.children {
+            if child.set_included_for_path(target, included) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Count total included files (recursively).
@@ -182,9 +197,44 @@ impl SourceList {
         }
     }
 
+    /// Set the included state of the node identified by `target` path.
+    pub fn set_included_for_path(&mut self, target: &Path, included: bool) {
+        for root in &mut self.roots {
+            if root.set_included_for_path(target, included) {
+                break;
+            }
+        }
+    }
+
+    /// Remove all roots.
+    pub fn clear(&mut self) {
+        self.roots.clear();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.roots.is_empty()
     }
+}
+
+/// Compute the destination path for a source file, preserving relative structure.
+/// Files inside a directory root are placed under `dest/<root_name>/relative/path`;
+/// files added individually are placed directly under `dest`.
+pub fn compute_destination(
+    src_path: &Path,
+    source_list: &SourceList,
+    dest_base: &Path,
+) -> PathBuf {
+    for root in &source_list.roots {
+        if root.is_dir {
+            if let Ok(relative) = src_path.strip_prefix(&root.path) {
+                return dest_base.join(&root.name).join(relative);
+            }
+        }
+    }
+    let filename = src_path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("unknown"));
+    dest_base.join(filename)
 }
 
 #[cfg(test)]
