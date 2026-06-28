@@ -206,6 +206,45 @@ src/                       -- React + Vite frontend
                               ThroughputChart, SettingsModal, CompletionSummary
 ```
 
+## Testing
+
+The copy engine is decoupled from the UI and from the OS so the orchestration is
+unit-testable:
+
+- All real copying sits behind the `FileCopier` trait (`engine/copier.rs`):
+  `SystemCopier` wraps `CopyFileExW` on Windows / `std::fs::copy` elsewhere; a
+  `MockCopier` replaces it in tests.
+- The platform-independent file loop, cancellation checks, conflict policy,
+  journal handling, and partial-file cleanup live in `engine/pipeline.rs`
+  (`process_item` / `run_copy`) and are driven by the tests with temp directories.
+
+Run the Rust tests (from `src-tauri/`) and the frontend tests:
+
+```bash
+cd src-tauri && cargo test     # engine, pipeline, scan estimator, enumeration
+npm test                       # frontend formatters (Vitest)
+```
+
+Covered by automated tests (deterministic, mock copier, temp dirs):
+
+1. Cancellation between files — cancel after file 1; asserts exactly one file is
+   copied and the rest are never processed.
+2. No corrupt destination on cancel — a simulated mid-file abort leaves the
+   partial destination **removed** (not a truncated look-alike) and not
+   journal-recorded.
+3. Resume correctness — after a cancelled run, a resume skips the journaled file
+   and copies only the remainder.
+4. Cancel-immediately then restart — cancel before file 1 leaves no artifacts and
+   nothing journaled; a fresh run then completes and contents match.
+5. Buffered/unbuffered decision (`select_mode`, `faster_mode_by_throughput`) —
+   pure functions tested on each side of the boundary, no I/O.
+6. Enumeration counts — a known temp tree yields the expected file/folder totals.
+
+**Not covered by unit tests** (stated explicitly, not implied): the real
+`CopyFileExW` / `COPY_FILE_RESTARTABLE` cancellation behavior (the actual OS call
+is mocked — only the orchestration around it is tested), and the live WebView/UI.
+These require a Windows host and manual/integration testing of the built app.
+
 ## License
 
 MIT

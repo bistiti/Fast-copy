@@ -414,4 +414,47 @@ mod tests {
         assert!(list.is_empty());
         assert_eq!(list.total_included_files(), 0);
     }
+
+    // ---- Test 6: enumeration counts on a known tree ----
+    #[test]
+    fn enumeration_counts_match_known_tree() {
+        use std::io::Write;
+        use std::sync::atomic::AtomicU32;
+
+        static N: AtomicU32 = AtomicU32::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "fast_copy_enum_{}_{}",
+            std::process::id(),
+            id
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Known tree: 6 files, 4 folders (root, sub1, sub2, sub2/deep).
+        let mk = |p: &Path| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let mut f = std::fs::File::create(p).unwrap();
+            f.write_all(b"x").unwrap();
+        };
+        std::fs::create_dir_all(&root).unwrap();
+        mk(&root.join("a.txt"));
+        mk(&root.join("b.txt"));
+        mk(&root.join("sub1/c.txt"));
+        mk(&root.join("sub2/d.txt"));
+        mk(&root.join("sub2/e.txt"));
+        mk(&root.join("sub2/deep/f.txt"));
+
+        let cancel = AtomicBool::new(false);
+        let progress = ScanProgress::new();
+        let node = scan_directory(root.clone(), &cancel, &progress).unwrap();
+
+        assert_eq!(progress.files_found.load(Ordering::Relaxed), 6);
+        assert_eq!(progress.folders_found.load(Ordering::Relaxed), 4);
+        // Top-level subfolders (T) of root = sub1, sub2.
+        assert_eq!(progress.top_level_total.load(Ordering::Relaxed), 2);
+        // The returned tree agrees on the file count.
+        assert_eq!(node.count_included_files(), 6);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

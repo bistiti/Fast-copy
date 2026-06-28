@@ -1,8 +1,10 @@
 // Copy engine module: orchestrates file copy operations, choosing between
 // buffered and unbuffered I/O per file based on the configured threshold.
 
+pub mod copier;
 pub mod copy_item;
 pub mod journal;
+pub mod pipeline;
 pub mod worker;
 #[cfg(windows)]
 pub mod win32;
