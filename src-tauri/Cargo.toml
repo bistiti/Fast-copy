@@ -1,6 +1,6 @@
 [package]
 name = "fast-copy"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Adaptive Windows file copy tool with dynamic buffered/unbuffered I/O selection"
 license = "MIT"
