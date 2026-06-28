@@ -33,12 +33,12 @@ const PROGRESS_STOP: u32 = 2;
 const COPY_FILE_RESTARTABLE: u32 = 0x0000_0002;
 const COPY_FILE_NO_BUFFERING: u32 = 0x0000_1000;
 
-/// Data passed to the progress callback via the lpData parameter. Raw pointers
-/// are sound here because the callback only runs synchronously inside the
-/// CopyFileExW call on the same thread, and the referents outlive that call.
-struct ProgressContext {
-    control: *const CopyControl,
-    on_progress: *mut dyn FnMut(u64),
+/// Data passed to the progress callback via the lpData parameter. The borrows
+/// are valid because the callback only runs synchronously inside the CopyFileExW
+/// call on the same thread, and both referents outlive that call.
+struct ProgressContext<'a> {
+    control: &'a CopyControl,
+    on_progress: &'a mut dyn FnMut(u64),
 }
 
 /// The progress routine called by CopyFileExW during the copy. Reports progress
@@ -59,20 +59,17 @@ unsafe extern "system" fn progress_routine(
         return PROGRESS_CONTINUE;
     }
 
-    let ctx = &*(lp_data as *const ProgressContext);
+    let ctx = &mut *(lp_data as *mut ProgressContext);
 
     // Report cumulative bytes (across all NTFS alternate data streams).
-    let transferred = total_bytes_transferred as u64;
-    let on_progress = &mut *ctx.on_progress;
-    on_progress(transferred);
+    (ctx.on_progress)(total_bytes_transferred as u64);
 
-    let control = &*ctx.control;
-    if control.is_cancelled() {
+    if ctx.control.is_cancelled() {
         return PROGRESS_CANCEL;
     }
     // PROGRESS_STOP -> CopyFileExW returns ERROR_REQUEST_ABORTED; the caller
     // distinguishes pause from cancel by checking the pause flag.
-    if control.is_paused() {
+    if ctx.control.is_paused() {
         return PROGRESS_STOP;
     }
 
@@ -103,9 +100,9 @@ pub fn copy_file_win32(
         CopyMode::Unbuffered => COPY_FILE_NO_BUFFERING | COPY_FILE_RESTARTABLE,
     };
 
-    let ctx = ProgressContext {
-        control: control as *const CopyControl,
-        on_progress: on_progress as *mut dyn FnMut(u64),
+    let mut ctx = ProgressContext {
+        control,
+        on_progress,
     };
 
     let result = unsafe {
@@ -113,7 +110,7 @@ pub fn copy_file_win32(
             PCWSTR(src_wide.as_ptr()),
             PCWSTR(dst_wide.as_ptr()),
             Some(progress_routine),
-            Some(&ctx as *const ProgressContext as *const std::ffi::c_void),
+            Some(&mut ctx as *mut ProgressContext as *const std::ffi::c_void),
             None, // pbCancel
             flags,
         )
