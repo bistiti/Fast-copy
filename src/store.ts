@@ -6,6 +6,7 @@ import type {
   BenchmarkInfo,
   Config,
   ConflictPolicy,
+  CopyBatchPayload,
   DonePayload,
   Phase,
   QueueEntryDto,
@@ -55,20 +56,15 @@ interface AppStore {
   clearCopy: () => void;
 
   // --- event reducers ---
-  onProgress: (index: number, bytesCopied: number) => void;
-  onFileDone: (index: number) => void;
-  onFileFailed: (index: number, error: string) => void;
-  onFileSkipped: (index: number) => void;
-  onThroughput: (p: ThroughputPayload) => void;
+  applyBatch: (b: CopyBatchPayload) => void;
   onDone: (p: DonePayload) => void;
 }
 
-function updateRow(
-  queue: QueueRow[],
-  index: number,
-  patch: Partial<QueueRow>,
-): QueueRow[] {
-  return queue.map((row) => (row.index === index ? { ...row, ...patch } : row));
+// Queue entries are built in index order (see `start_copy`), so a row's array
+// position equals its `index`. We rely on that for O(1) lookup, with a guard.
+function rowPosition(queue: QueueRow[], index: number): number {
+  if (queue[index]?.index === index) return index;
+  return queue.findIndex((r) => r.index === index);
 }
 
 export const useStore = create<AppStore>((set) => ({
@@ -123,30 +119,34 @@ export const useStore = create<AppStore>((set) => ({
       summary: null,
     }),
 
-  onProgress: (index, bytesCopied) =>
-    set((s) => ({
-      queue: updateRow(s.queue, index, { status: "inProgress", bytesCopied }),
-    })),
-  onFileDone: (index) =>
-    set((s) => ({
-      queue: updateRow(s.queue, index, {
-        status: "done",
-        bytesCopied:
-          s.queue.find((r) => r.index === index)?.size ?? 0,
-      }),
-    })),
-  onFileFailed: (index, error) =>
-    set((s) => ({
-      queue: updateRow(s.queue, index, { status: "failed", error }),
-    })),
-  onFileSkipped: (index) =>
-    set((s) => ({
-      queue: updateRow(s.queue, index, { status: "skipped" }),
-    })),
-  onThroughput: (p) =>
-    set((s) => ({
-      progress: p,
-      throughputHistory: [...s.throughputHistory, p.speed].slice(-HISTORY_LEN),
-    })),
+  // Apply one coalesced batch (rows + throughput) in a single store update, so a
+  // copy of any size produces at most one React render per ~300 ms tick. The
+  // queue array is shallow-copied once (cheap pointer copy); only changed rows
+  // get a new object — O(changed rows), not O(queue) of object spreads.
+  applyBatch: (b) =>
+    set((s) => {
+      let queue = s.queue;
+      if (b.rows.length > 0) {
+        queue = s.queue.slice();
+        for (const d of b.rows) {
+          const pos = rowPosition(queue, d.index);
+          if (pos < 0) continue;
+          const cur = queue[pos];
+          queue[pos] = {
+            ...cur,
+            status: d.status,
+            bytesCopied: d.bytesCopied,
+            ...(d.error != null ? { error: d.error } : {}),
+          };
+        }
+      }
+      return {
+        queue,
+        progress: b.throughput,
+        throughputHistory: [...s.throughputHistory, b.throughput.speed].slice(
+          -HISTORY_LEN,
+        ),
+      };
+    }),
   onDone: (summary) => set({ phase: "done", summary }),
 }));

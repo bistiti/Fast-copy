@@ -340,11 +340,13 @@ pub fn resume(state: State<AppState>) {
 /// any running copy. Safe to call in any phase.
 #[tauri::command]
 pub fn cancel(state: State<AppState>) {
+    crate::trace::log("cancel: command handler entered");
     state.scan_cancel.store(true, Ordering::SeqCst);
     state.bench_cancel.store(true, Ordering::SeqCst);
     if let Some(ctrl) = state.copy_control.lock().unwrap().as_ref() {
         ctrl.request_cancel();
     }
+    crate::trace::log("cancel: cancel flag set");
 }
 
 // ---- Helpers ----
