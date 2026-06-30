@@ -9,12 +9,27 @@ import { useStore } from "./store";
 import type {
   BenchmarkInfo,
   Config,
+  CopyBatchPayload,
   DonePayload,
   QueueEntryDto,
   ScanProgressPayload,
-  ThroughputPayload,
   Tree,
 } from "./types";
+
+/** Debug-gated client trace (Step 2). Enable with
+ *  `localStorage.setItem("FASTCOPY_TRACE", "1")` then reload. Logs to the
+ *  devtools console with a high-resolution timestamp; pairs with the Rust-side
+ *  `%TEMP%\fastcopy-trace.log` to measure webview event-loop backpressure. */
+function trace(msg: string) {
+  try {
+    if (localStorage.getItem("FASTCOPY_TRACE") === "1") {
+      // eslint-disable-next-line no-console
+      console.log(`[trace ${performance.now().toFixed(1)}ms] ${msg}`);
+    }
+  } catch {
+    /* localStorage may be unavailable; tracing is best-effort. */
+  }
+}
 
 const store = () => useStore.getState();
 
@@ -159,7 +174,9 @@ export async function resumeCopy() {
 
 /// Stop whatever is running: scan, benchmark, or copy.
 export async function stop() {
+  trace("stop: invoking cancel");
   await guard(() => invoke("cancel"));
+  trace("stop: cancel invoke returned");
 }
 
 // ---- event wiring ----
@@ -167,23 +184,17 @@ export async function stop() {
 export async function setupListeners() {
   const s = store();
 
-  await listen<{ index: number; bytesCopied: number }>(
-    "copy://progress",
-    (e) => s.onProgress(e.payload.index, e.payload.bytesCopied),
-  );
-  await listen<{ index: number }>("copy://file-done", (e) =>
-    s.onFileDone(e.payload.index),
-  );
-  await listen<{ index: number; error: string }>("copy://file-failed", (e) =>
-    s.onFileFailed(e.payload.index, e.payload.error),
-  );
-  await listen<{ index: number }>("copy://file-skipped", (e) =>
-    s.onFileSkipped(e.payload.index),
-  );
-  await listen<ThroughputPayload>("copy://throughput", (e) =>
-    s.onThroughput(e.payload),
-  );
-  await listen<DonePayload>("copy://done", (e) => s.onDone(e.payload));
+  // A single coalesced event carries all per-file row deltas plus the throughput
+  // aggregate, at ~3×/sec. This replaces the former per-file event stream, which
+  // flooded the webview event loop on large queues.
+  await listen<CopyBatchPayload>("copy://batch", (e) => {
+    trace(`batch: ${e.payload.rows.length} rows`);
+    s.applyBatch(e.payload);
+  });
+  await listen<DonePayload>("copy://done", (e) => {
+    trace("done");
+    s.onDone(e.payload);
+  });
 
   await listen<ScanProgressPayload>("scan://progress", (e) => {
     // Ignore late events after a scan has ended.

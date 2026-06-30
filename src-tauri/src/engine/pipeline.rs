@@ -195,6 +195,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -548,6 +549,409 @@ mod tests {
         assert!(dsts[0].exists());
         assert_ne!(items[0].destination, dsts[0]);
         assert!(items[0].destination.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ================== Step 5: hot-path / responsiveness tests ==================
+
+    /// Reporter that counts callbacks (to assert progress cadence / no stalls).
+    #[derive(Default)]
+    struct CountingReporter {
+        progress_count: AtomicUsize,
+        completed_count: AtomicUsize,
+    }
+    impl ItemReporter for CountingReporter {
+        fn progress(&self, _index: usize, _bytes: u64) {
+            self.progress_count.fetch_add(1, Ordering::SeqCst);
+        }
+        fn completed(&self, _index: usize) {
+            self.completed_count.fetch_add(1, Ordering::SeqCst);
+        }
+        fn failed(&self, _index: usize, _error: String) {}
+        fn skipped(&self, _index: usize) {}
+    }
+
+    /// Fast copier that performs no real file I/O: it just reports progress and
+    /// counts. Used for the many-small-files profile so the test is bounded by
+    /// CPU, not disk. Can trip cancel after a given number of files.
+    #[derive(Default)]
+    struct CountingCopier {
+        copied: AtomicUsize,
+        progress_calls: AtomicUsize,
+        cancel_after: Option<usize>,
+    }
+    impl FileCopier for CountingCopier {
+        fn copy_file(
+            &self,
+            item: &CopyItem,
+            control: &CopyControl,
+            on_progress: &mut dyn FnMut(u64),
+        ) -> CopyOutcome {
+            on_progress(item.size);
+            self.progress_calls.fetch_add(1, Ordering::SeqCst);
+            let n = self.copied.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(k) = self.cancel_after {
+                if n >= k {
+                    control.request_cancel();
+                }
+            }
+            CopyOutcome::Done
+        }
+    }
+
+    /// Copier that sleeps per file (so pause/resume timing is observable) and
+    /// counts completed files. Pause is enforced by `process_item`, not here.
+    struct SleepCopier {
+        copied: AtomicUsize,
+        ms: u64,
+    }
+    impl FileCopier for SleepCopier {
+        fn copy_file(
+            &self,
+            item: &CopyItem,
+            _control: &CopyControl,
+            on_progress: &mut dyn FnMut(u64),
+        ) -> CopyOutcome {
+            std::thread::sleep(std::time::Duration::from_millis(self.ms));
+            on_progress(item.size);
+            self.copied.fetch_add(1, Ordering::SeqCst);
+            CopyOutcome::Done
+        }
+    }
+
+    /// Copier simulating a large file delivered in chunks, honouring cancel
+    /// between chunks exactly like the CopyFileExW progress routine returning
+    /// PROGRESS_CANCEL. Writes a growing partial destination so cleanup can be
+    /// verified. Optionally trips cancel itself after a given chunk.
+    struct ChunkedCopier {
+        chunks: u64,
+        cancel_at_chunk: Option<u64>,
+    }
+    impl FileCopier for ChunkedCopier {
+        fn copy_file(
+            &self,
+            item: &CopyItem,
+            control: &CopyControl,
+            on_progress: &mut dyn FnMut(u64),
+        ) -> CopyOutcome {
+            if let Some(p) = item.destination.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            let chunk = (item.size / self.chunks).max(1);
+            let mut transferred: u64 = 0;
+            let mut c: u64 = 0;
+            while transferred < item.size {
+                if control.is_cancelled() {
+                    return CopyOutcome::Cancelled;
+                }
+                transferred = (transferred + chunk).min(item.size);
+                c += 1;
+                // Mimic real bytes landing on disk before completion.
+                std::fs::write(&item.destination, vec![0u8; transferred as usize]).unwrap();
+                on_progress(transferred);
+                if self.cancel_at_chunk == Some(c) {
+                    control.request_cancel();
+                }
+            }
+            // Finalize with the real contents.
+            std::fs::copy(&item.source, &item.destination).unwrap();
+            CopyOutcome::Done
+        }
+    }
+
+    /// Build `n` CopyItems with non-existent sources (the mock copier never reads
+    /// them) so we can exercise 50k items without writing 50k source files.
+    fn make_phantom_items(dir: &Path, n: usize) -> Vec<CopyItem> {
+        let dst_dir = dir.join("dst");
+        let src_dir = dir.join("src");
+        let mut items = Vec::with_capacity(n);
+        for i in 0..n {
+            let src = src_dir.join(format!("f{}.bin", i));
+            let dst = dst_dir.join(format!("f{}.bin", i));
+            items.push(CopyItem::new(src, dst, 4096, 1024 * 1024));
+        }
+        items
+    }
+
+    // ---- Many small files: Stop halts the count within one file ----
+    #[test]
+    fn many_small_files_stop_within_one_file() {
+        let dir = temp_dir("many_small_stop");
+        let mut items = make_phantom_items(&dir, 50_000);
+        let copier = CountingCopier {
+            cancel_after: Some(1000),
+            ..Default::default()
+        };
+        let control = CopyControl::new();
+        let journal = journal_in(&dir);
+        let reporter = TestReporter::default();
+
+        let summary = run_copy(
+            &mut items,
+            &copier,
+            &control,
+            &journal,
+            ConflictPolicy::Overwrite,
+            &reporter,
+        );
+
+        assert!(summary.cancelled);
+        // Cancel was tripped while copying file #1000; processing stops before the
+        // next file — the files-copied count does not keep climbing.
+        assert_eq!(summary.copied, 1000);
+        assert!(
+            copier.copied.load(Ordering::SeqCst) <= 1001,
+            "no more than one file copied after Stop was observed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Many small files: progress callback fires for every file (no stall) ----
+    #[test]
+    fn many_small_files_progress_callback_fires_for_every_file() {
+        let dir = temp_dir("many_small_cadence");
+        let n = 50_000usize;
+        let mut items = make_phantom_items(&dir, n);
+        let copier = CountingCopier::default();
+        let control = CopyControl::new();
+        let journal = journal_in(&dir);
+        let reporter = CountingReporter::default();
+
+        let summary = run_copy(
+            &mut items,
+            &copier,
+            &control,
+            &journal,
+            ConflictPolicy::Overwrite,
+            &reporter,
+        );
+
+        assert_eq!(summary.copied, n);
+        // The progress callback fired once per file and never stalled.
+        assert_eq!(copier.progress_calls.load(Ordering::SeqCst), n);
+        assert_eq!(reporter.progress_count.load(Ordering::SeqCst), n);
+        assert_eq!(reporter.completed_count.load(Ordering::SeqCst), n);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Pause halts progress; Resume continues to completion ----
+    #[test]
+    fn pause_halts_progress_then_resume_completes() {
+        let dir = temp_dir("pause_resume");
+        let n = 40usize;
+        let dir_for_thread = dir.clone();
+        let control = Arc::new(CopyControl::new());
+        let copier = Arc::new(SleepCopier {
+            copied: AtomicUsize::new(0),
+            ms: 5,
+        });
+
+        let c2 = Arc::clone(&control);
+        let cp2 = Arc::clone(&copier);
+        let handle = std::thread::spawn(move || {
+            let mut items = make_phantom_items(&dir_for_thread, n);
+            let journal = journal_in(&dir_for_thread);
+            let reporter = TestReporter::default();
+            run_copy(
+                &mut items,
+                &*cp2,
+                &*c2,
+                &journal,
+                ConflictPolicy::Overwrite,
+                &reporter,
+            );
+            cp2.copied.load(Ordering::SeqCst)
+        });
+
+        // Let several files copy, then pause.
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        control.request_pause();
+        // Let any in-flight file finish and the worker park.
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let a = copier.copied.load(Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let b = copier.copied.load(Ordering::SeqCst);
+
+        assert_eq!(a, b, "no files copied while paused");
+        assert!(a > 0 && a < n, "pause took effect mid-run (got {a})");
+
+        control.resume();
+        let final_copied = handle.join().unwrap();
+        assert_eq!(final_copied, n, "resume completed the remaining files");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Large file: cancel mid-file via the chunk callback is prompt + clean ----
+    #[test]
+    fn large_file_cancel_midfile_via_callback_is_prompt_and_clean() {
+        let dir = temp_dir("large_cancel");
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("big.bin");
+        let size: usize = 1 << 20; // 1 MiB
+        write_file(&src, &vec![7u8; size]);
+        let dst = dir.join("dst").join("big.bin");
+        let mut items = vec![CopyItem::new(
+            src.clone(),
+            dst.clone(),
+            size as u64,
+            1024 * 1024,
+        )];
+
+        let copier = ChunkedCopier {
+            chunks: 64,
+            cancel_at_chunk: Some(4),
+        };
+        let control = CopyControl::new();
+        let journal = journal_in(&dir);
+        let reporter = CountingReporter::default();
+
+        let summary = run_copy(
+            &mut items,
+            &copier,
+            &control,
+            &journal,
+            ConflictPolicy::Overwrite,
+            &reporter,
+        );
+
+        assert!(summary.cancelled);
+        // Cancel honoured within one chunk of being set (prompt mid-file abort).
+        assert!(
+            reporter.progress_count.load(Ordering::SeqCst) <= 6,
+            "cancel should be honoured within a chunk, not at end-of-file"
+        );
+        // The partial destination must be removed — nothing that looks complete
+        // is left truncated — and it must not be journal-recorded.
+        assert!(!dst.exists(), "partial large-file destination must be removed");
+        assert!(!journal.lock().unwrap().is_completed(&dst));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Mixed tree (varied sizes, subfolders) copies fully with matching bytes ----
+    #[test]
+    fn mixed_tree_copies_all_and_contents_match() {
+        let dir = temp_dir("mixed");
+        let src_dir = dir.join("src");
+        let dst_dir = dir.join("dst");
+
+        // (relative path, size) — includes a zero-byte file and a larger one.
+        let spec: [(&str, usize); 5] = [
+            ("a/small.txt", 10),
+            ("a/empty.bin", 0),
+            ("b/medium.bin", 4096),
+            ("b/c/large.bin", 256 * 1024),
+            ("root.dat", 1),
+        ];
+
+        let mut items = Vec::new();
+        let mut dsts = Vec::new();
+        for (rel, sz) in spec.iter() {
+            let src = src_dir.join(rel);
+            let dst = dst_dir.join(rel);
+            // Deterministic, size-dependent contents.
+            let contents: Vec<u8> = (0..*sz).map(|i| (i % 251) as u8).collect();
+            write_file(&src, &contents);
+            items.push(CopyItem::new(src, dst.clone(), *sz as u64, 1024 * 1024));
+            dsts.push(dst);
+        }
+
+        let copier = MockCopier::default(); // performs a real fs::copy
+        let control = CopyControl::new();
+        let journal = journal_in(&dir);
+        let reporter = TestReporter::default();
+
+        let summary = run_copy(
+            &mut items,
+            &copier,
+            &control,
+            &journal,
+            ConflictPolicy::Overwrite,
+            &reporter,
+        );
+
+        assert_eq!(summary.copied, spec.len());
+        assert!(!summary.cancelled);
+        for (item, dst) in items.iter().zip(dsts.iter()) {
+            assert!(dst.exists(), "destination {:?} should exist", dst);
+            let src_bytes = std::fs::read(&item.source).unwrap();
+            let dst_bytes = std::fs::read(dst).unwrap();
+            assert_eq!(src_bytes, dst_bytes, "contents must match for {:?}", dst);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Cancel mid-file leaves no partial, then a fresh restart completes ----
+    #[test]
+    fn cancel_then_restart_no_partial_and_completes() {
+        let dir = temp_dir("cancel_restart");
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let mut srcs = Vec::new();
+        let mut dsts = Vec::new();
+        for i in 0..3 {
+            let src = src_dir.join(format!("f{}.bin", i));
+            // ~64 KiB each so the chunked copier delivers several chunks.
+            write_file(&src, &vec![(i as u8).wrapping_add(1); 64 * 1024]);
+            srcs.push(src);
+            dsts.push(dir.join("dst").join(format!("f{}.bin", i)));
+        }
+        let build_items = || -> Vec<CopyItem> {
+            srcs.iter()
+                .zip(dsts.iter())
+                .map(|(s, d)| CopyItem::new(s.clone(), d.clone(), 64 * 1024, 1024 * 1024))
+                .collect()
+        };
+
+        let journal = journal_in(&dir);
+
+        // First pass: cancel mid-file 0.
+        let mut items1 = build_items();
+        let copier1 = ChunkedCopier {
+            chunks: 8,
+            cancel_at_chunk: Some(2),
+        };
+        let control1 = CopyControl::new();
+        let reporter1 = TestReporter::default();
+        let s1 = run_copy(
+            &mut items1,
+            &copier1,
+            &control1,
+            &journal,
+            ConflictPolicy::Overwrite,
+            &reporter1,
+        );
+        assert!(s1.cancelled);
+        // No partial artifacts and nothing journaled.
+        assert!(dsts.iter().all(|d| !d.exists()), "no partial files remain");
+        assert_eq!(journal.lock().unwrap().completed_count(), 0);
+
+        // Restart fresh: a full copy completes everything with matching bytes.
+        let mut items2 = build_items();
+        let copier2 = MockCopier::default();
+        let control2 = CopyControl::new();
+        let reporter2 = TestReporter::default();
+        let s2 = run_copy(
+            &mut items2,
+            &copier2,
+            &control2,
+            &journal,
+            ConflictPolicy::Overwrite,
+            &reporter2,
+        );
+        assert_eq!(s2.copied, 3);
+        assert!(!s2.cancelled);
+        for (s, d) in srcs.iter().zip(dsts.iter()) {
+            assert!(d.exists());
+            assert_eq!(std::fs::read(s).unwrap(), std::fs::read(d).unwrap());
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

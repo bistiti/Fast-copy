@@ -95,6 +95,21 @@ export interface ThroughputPayload {
   currentIndex: number | null;
 }
 
+/** One coalesced per-file state change inside a batch. */
+export interface RowDelta {
+  index: number;
+  status: RowStatus;
+  bytesCopied: number;
+  error: string | null;
+}
+
+/** A single `copy://batch` event: all row deltas since the last tick plus the
+ *  current throughput aggregate. Emitted ~3×/sec regardless of file count. */
+export interface CopyBatchPayload {
+  rows: RowDelta[];
+  throughput: ThroughputPayload;
+}
+
 export interface DonePayload {
   totalCopied: number;
   totalBytes: number;

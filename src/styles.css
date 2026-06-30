@@ -505,12 +505,28 @@ body {
 
 /* ---- Queue rows ---- */
 
+/* Virtualized queue: spacer reserves full scroll height; the window is
+   translated to the first visible row. Row height is fixed (see ROW_HEIGHT in
+   QueuePanel.tsx) so windowing math stays exact. */
+.qvirt {
+  position: relative;
+  width: 100%;
+}
+.qvirt-window {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
 .qrow {
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 7px 9px;
   border-radius: 7px;
+  height: 34px;
+  box-sizing: border-box;
 }
 .qrow:hover {
   background: var(--bg-2);

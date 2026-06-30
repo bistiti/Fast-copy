@@ -1,15 +1,28 @@
-// Bridge thread: drains the engine's crossbeam channel and re-emits each event
-// to the webview as a Tauri event. Also samples copy throughput on a fixed tick
-// so the frontend can render a live speed/ETA/chart without per-message spam.
+// Bridge thread: drains the engine's crossbeam channel and forwards progress to
+// the webview. To keep the webview's single JS thread responsive under very
+// large queues, per-file events are NOT emitted individually. Instead the bridge
+// accumulates row deltas (latest-state-wins, coalesced per file) plus the live
+// throughput aggregate and emits ONE `copy://batch` event per fixed tick. This
+// bounds IPC traffic to ~3 events/sec regardless of file throughput, so a copy
+// of 100k+ files cannot flood the webview event loop (the root cause of the
+// "Not responding" freeze and the stalled count/ETA — see commit message).
 
 use crate::engine::worker::WorkerMessage;
 use crossbeam_channel::Receiver;
-use serde_json::json;
+use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
-/// How often to emit a throughput sample (ms).
+/// How often to flush a batch (row deltas + throughput sample), in ms.
 const SAMPLE_INTERVAL_MS: u64 = 300;
+
+/// One pending per-file state change, coalesced within a tick (latest wins).
+struct RowDelta {
+    status: &'static str,
+    bytes_copied: u64,
+    error: Option<String>,
+}
 
 /// Spawn the forwarder. Consumes `rx`; runs until `AllDone` or the channel closes.
 /// `folder_of[i]` maps file i to its folder; `folder_counts[f]` is the number of
@@ -22,6 +35,7 @@ pub fn spawn(
     folder_counts: Vec<u32>,
 ) {
     std::thread::spawn(move || {
+        crate::trace::log(&format!("bridge: start, files={}", sizes.len()));
         let n = sizes.len();
         let total_bytes: u64 = sizes.iter().sum();
         let mut per_file: Vec<u64> = vec![0; n];
@@ -36,6 +50,9 @@ pub fn spawn(
         let mut folders_done: usize = 0;
         // Index of the most recently active file, for the "currently copying" line.
         let mut current_index: Option<usize> = None;
+
+        // Per-tick coalesced row deltas, keyed by file index (latest state wins).
+        let mut pending: HashMap<usize, RowDelta> = HashMap::new();
 
         let start = Instant::now();
         let mut last_sample_time = start;
@@ -54,9 +71,15 @@ pub fn spawn(
                             total_copied += bytes_copied - *slot;
                             *slot = bytes_copied;
                         }
-                        let _ = app.emit(
-                            "copy://progress",
-                            json!({ "index": index, "bytesCopied": *slot }),
+                        // Coalesce: many CopyFileExW callbacks for one large file
+                        // collapse to a single delta carrying the latest byte count.
+                        pending.insert(
+                            index,
+                            RowDelta {
+                                status: "inProgress",
+                                bytes_copied: *slot,
+                                error: None,
+                            },
                         );
                     }
                 }
@@ -67,15 +90,26 @@ pub fn spawn(
                     }
                     files_done += 1;
                     finish_in_folder(index, &folder_of, &mut folder_remaining, &mut folders_done);
-                    let _ = app.emit("copy://file-done", json!({ "index": index }));
+                    pending.insert(
+                        index,
+                        RowDelta {
+                            status: "done",
+                            bytes_copied: sizes.get(index).copied().unwrap_or(0),
+                            error: None,
+                        },
+                    );
                 }
                 Ok(WorkerMessage::FileFailed { index, error }) => {
                     files_failed += 1;
                     finish_in_folder(index, &folder_of, &mut folder_remaining, &mut folders_done);
                     errors.push(error.clone());
-                    let _ = app.emit(
-                        "copy://file-failed",
-                        json!({ "index": index, "error": error }),
+                    pending.insert(
+                        index,
+                        RowDelta {
+                            status: "failed",
+                            bytes_copied: per_file.get(index).copied().unwrap_or(0),
+                            error: Some(error),
+                        },
                     );
                 }
                 Ok(WorkerMessage::FileSkipped { index }) => {
@@ -85,9 +119,38 @@ pub fn spawn(
                     }
                     files_skipped += 1;
                     finish_in_folder(index, &folder_of, &mut folder_remaining, &mut folders_done);
-                    let _ = app.emit("copy://file-skipped", json!({ "index": index }));
+                    pending.insert(
+                        index,
+                        RowDelta {
+                            status: "skipped",
+                            bytes_copied: sizes.get(index).copied().unwrap_or(0),
+                            error: None,
+                        },
+                    );
                 }
                 Ok(WorkerMessage::AllDone) => {
+                    crate::trace::log(&format!(
+                        "bridge: AllDone received, files_done={files_done} failed={files_failed} skipped={files_skipped}"
+                    ));
+                    // Flush any rows accumulated since the last tick, plus a final
+                    // throughput snapshot, before the terminal summary.
+                    emit_batch(
+                        &app,
+                        &mut pending,
+                        throughput_fields(
+                            0.0,
+                            total_copied,
+                            total_bytes,
+                            -1.0,
+                            start.elapsed().as_secs_f64(),
+                            files_done,
+                            files_failed,
+                            files_skipped,
+                            folders_done,
+                            folders_total,
+                            current_index,
+                        ),
+                    );
                     emit_done(
                         &app,
                         total_copied,
@@ -98,13 +161,31 @@ pub fn spawn(
                         files_skipped,
                         &errors,
                     );
+                    crate::trace::log("bridge: copy://done emitted");
                     break;
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    // Fall through to emit a throughput sample below.
+                    // Fall through to flush a batch below.
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     // Channel closed without an explicit AllDone — finalize anyway.
+                    emit_batch(
+                        &app,
+                        &mut pending,
+                        throughput_fields(
+                            0.0,
+                            total_copied,
+                            total_bytes,
+                            -1.0,
+                            start.elapsed().as_secs_f64(),
+                            files_done,
+                            files_failed,
+                            files_skipped,
+                            folders_done,
+                            folders_total,
+                            current_index,
+                        ),
+                    );
                     emit_done(
                         &app,
                         total_copied,
@@ -119,7 +200,8 @@ pub fn spawn(
                 }
             }
 
-            // Emit a throughput sample on every tick.
+            // Flush a single batched event on each tick: coalesced row deltas plus
+            // the throughput aggregate. One emit per tick, independent of file count.
             let now = Instant::now();
             let dt = now.duration_since(last_sample_time).as_secs_f64();
             if dt >= (SAMPLE_INTERVAL_MS as f64) / 1000.0 {
@@ -133,27 +215,76 @@ pub fn spawn(
                 } else {
                     -1.0
                 };
-                let _ = app.emit(
-                    "copy://throughput",
-                    json!({
-                        "speed": speed,
-                        "totalCopied": total_copied,
-                        "totalBytes": total_bytes,
-                        "eta": eta,
-                        "elapsedSecs": start.elapsed().as_secs_f64(),
-                        "filesDone": files_done,
-                        "filesFailed": files_failed,
-                        "filesSkipped": files_skipped,
-                        "foldersDone": folders_done,
-                        "foldersTotal": folders_total,
-                        "currentIndex": current_index,
-                    }),
+                emit_batch(
+                    &app,
+                    &mut pending,
+                    throughput_fields(
+                        speed,
+                        total_copied,
+                        total_bytes,
+                        eta,
+                        start.elapsed().as_secs_f64(),
+                        files_done,
+                        files_failed,
+                        files_skipped,
+                        folders_done,
+                        folders_total,
+                        current_index,
+                    ),
                 );
                 last_sample_time = now;
                 last_sample_copied = total_copied;
             }
         }
     });
+}
+
+/// Build the throughput aggregate object shared by every batch.
+#[allow(clippy::too_many_arguments)]
+fn throughput_fields(
+    speed: f64,
+    total_copied: u64,
+    total_bytes: u64,
+    eta: f64,
+    elapsed_secs: f64,
+    files_done: usize,
+    files_failed: usize,
+    files_skipped: usize,
+    folders_done: usize,
+    folders_total: usize,
+    current_index: Option<usize>,
+) -> Value {
+    json!({
+        "speed": speed,
+        "totalCopied": total_copied,
+        "totalBytes": total_bytes,
+        "eta": eta,
+        "elapsedSecs": elapsed_secs,
+        "filesDone": files_done,
+        "filesFailed": files_failed,
+        "filesSkipped": files_skipped,
+        "foldersDone": folders_done,
+        "foldersTotal": folders_total,
+        "currentIndex": current_index,
+    })
+}
+
+/// Emit one `copy://batch`: drains the pending row deltas into an array and
+/// pairs them with the throughput aggregate. Always emitted on a tick (even with
+/// zero rows) so count/ETA keep refreshing.
+fn emit_batch(app: &AppHandle, pending: &mut HashMap<usize, RowDelta>, throughput: Value) {
+    let rows: Vec<Value> = pending
+        .drain()
+        .map(|(index, d)| {
+            json!({
+                "index": index,
+                "status": d.status,
+                "bytesCopied": d.bytes_copied,
+                "error": d.error,
+            })
+        })
+        .collect();
+    let _ = app.emit("copy://batch", json!({ "rows": rows, "throughput": throughput }));
 }
 
 /// Decrement a folder's remaining-file count when one of its files reaches a

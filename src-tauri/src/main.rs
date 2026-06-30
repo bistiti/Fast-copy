@@ -23,6 +23,7 @@ mod engine;
 mod scan_progress;
 mod sources;
 mod state;
+mod trace;
 
 use state::AppState;
 
